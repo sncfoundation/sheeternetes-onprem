@@ -12,6 +12,8 @@
 #   skctl apply lab/hello-web.json
 #   skctl scale <deployment> <replicas>
 #   skctl delete <deployment>
+#   skctl cordon|uncordon|drain <node>   # node maintenance (drain evicts pods)
+#   skctl migrate <pod> <node>           # move a pod to a target node
 #   skctl tour                      # guided demo
 #
 set -euo pipefail
@@ -48,6 +50,14 @@ case "$cmd" in
   delete)
     name="${1:?deployment}"
     api_post "$(jq -n --arg t "$TOKEN" --arg n "$name" '{token:$t, action:"delete", name:$n}')" | jq .
+    ;;
+  cordon|uncordon|drain)
+    name="${1:?node}"
+    api_post "$(jq -n --arg t "$TOKEN" --arg a "$cmd" --arg n "$name" '{token:$t, action:$a, name:$n}')" | jq .
+    ;;
+  migrate)
+    pod="${1:?usage: skctl migrate <pod> <node>}"; node="${2:?target node}"
+    api_post "$(jq -n --arg t "$TOKEN" --arg p "$pod" --arg n "$node" '{token:$t, action:"migrate", name:$p, node:$n}')" | jq .
     ;;
   tour)
     exec "$here/lab/tour.sh"

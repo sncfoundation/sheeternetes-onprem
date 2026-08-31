@@ -3,7 +3,7 @@
 WORKBOOK ?= cluster.xlsx
 PORT     ?= 8787
 
-.PHONY: help up node apply pods nodes events tour down clean
+.PHONY: help up node apply pods nodes events tour test down clean
 help:            ## show targets
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | sed 's/:.*##/\t—/' | sort
 
@@ -21,6 +21,9 @@ pods nodes events: ## show pods / nodes / events
 
 tour:            ## guided demo
 	./skctl tour
+
+test:            ## run the unit + integration suite
+	python3 -m pytest -q
 
 down:            ## stop demo workloads (scale everything created by the lab to 0)
 	-./skctl scale web 0
