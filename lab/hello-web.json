@@ -1,0 +1,6 @@
+{
+  "deployments": [
+    { "name": "web",   "image": "nginx:alpine",      "replicas": 2, "cpu_req": 100, "mem_req": 32, "command": "" },
+    { "name": "hello", "image": "hashicorp/http-echo","replicas": 1, "cpu_req": 50,  "mem_req": 16, "command": "-text=hello-from-a-spreadsheet -listen=:8080" }
+  ]
+}
