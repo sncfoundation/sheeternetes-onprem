@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install openpyxl pytest
+      - name: Compile check
+        run: python -m py_compile apiserver.py bridge.py
+      - name: Shell syntax
+        run: bash -n kubelet.sh skctl lab/tour.sh
+      - name: Unit + integration tests
+        run: python -m pytest -q
