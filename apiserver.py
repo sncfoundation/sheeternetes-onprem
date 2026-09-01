@@ -14,10 +14,14 @@ Ready, schedulable nodes by cpu_req/mem_req (a pod that fits nowhere is Unschedu
 keeps pods sticky to their node, ages out silent nodes (failover), and honors
 cordon/drain. The scheduler core is the pure function `schedule()` below.
 
+Auth: every request carries a shared token. Additionally, if SIGNING_KEY is set, POSTs
+must be HMAC-SHA256 signed (X-SNCF-Timestamp + X-SNCF-Signature) within SIGN_TTL seconds —
+tamper- and replay-resistant. See bridge.py, which signs its cross-substrate payloads.
+
 Requires: openpyxl  (pip install openpyxl). The spreadsheet is the store; this process
 is the apiserver. See bridge.py for hybrid federation with Google Sheets.
 """
-import json, os, time
+import hashlib, hmac, json, os, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -25,6 +29,8 @@ WORKBOOK = os.environ.get("WORKBOOK", "cluster.xlsx")
 TOKEN = os.environ.get("TOKEN", "CHANGE_ME_super_secret")
 PORT = int(os.environ.get("PORT", "8787"))
 NODE_TTL = int(os.environ.get("NODE_TTL", "30"))   # seconds before a silent node is NotReady
+SIGNING_KEY = os.environ.get("SIGNING_KEY", "")    # if set, POSTs must carry a valid HMAC
+SIGN_TTL = int(os.environ.get("SIGN_TTL", "300"))  # max clock skew (s) for a signed request
 TABS = {
     "Deployments": ["name", "image", "replicas", "cpu_req", "mem_req", "command", "node_selector", "tolerations"],
     "Nodes": ["name", "ip", "cpu_total", "cpu_used", "mem_total", "status", "last_heartbeat", "schedulable", "labels", "taints"],
@@ -83,6 +89,22 @@ def _int(v, default=0):
 def _truthy(v, default=True):
     if v in (None, ""): return default
     return str(v).strip().upper() not in ("FALSE", "0", "NO")
+
+def sign(key, ts, body):
+    """HMAC-SHA256 over 'timestamp.body' — the wire signature. Pure, so the bridge
+    can produce byte-identical signatures and both sides can unit-test it."""
+    if isinstance(body, str): body = body.encode()
+    msg = str(ts).encode() + b"." + body
+    return hmac.new(key.encode(), msg, hashlib.sha256).hexdigest()
+
+def verify(key, ts, sig, body, now, ttl):
+    """Constant-time verify with a bounded clock skew (anti-replay)."""
+    if not (key and ts and sig): return False
+    try:
+        if abs(now - int(ts)) > ttl: return False
+    except (TypeError, ValueError):
+        return False
+    return hmac.compare_digest(sign(key, ts, body), sig)
 
 def parse_kv(s):
     """'disk=ssd,zone=a' -> {'disk':'ssd','zone':'a'}  (labels / node_selector)."""
@@ -375,7 +397,12 @@ class H(BaseHTTPRequestHandler):
         self._json({"items": items})
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
-        try: body = json.loads(self.rfile.read(n) or b"{}")
+        raw = self.rfile.read(n) or b"{}"
+        if SIGNING_KEY and not verify(SIGNING_KEY, self.headers.get("X-SNCF-Timestamp", ""),
+                                      self.headers.get("X-SNCF-Signature", ""), raw,
+                                      int(time.time()), SIGN_TTL):
+            return self._json({"error": "bad signature"}, 401)
+        try: body = json.loads(raw)
         except Exception: return self._json({"error": "bad json"}, 400)
         if body.get("token") != TOKEN: return self._json({"error": "unauthorized"}, 401)
         a = body.get("action")
@@ -399,5 +426,6 @@ class H(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     _wb()
-    print(f"[apiserver] serving {WORKBOOK} on http://0.0.0.0:{PORT} (kinds: {', '.join(TABS)})")
+    print(f"[apiserver] serving {WORKBOOK} on http://0.0.0.0:{PORT} (kinds: {', '.join(TABS)})"
+          + (" · HMAC signing REQUIRED on POST" if SIGNING_KEY else ""))
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()

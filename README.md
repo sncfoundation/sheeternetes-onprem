@@ -95,14 +95,25 @@ python3 bridge.py sync --interval 60 --local http://localhost:8787 --local-token
                        --peer https://script.google.com/macros/s/XXXX/exec --peer-token secret2
 ```
 
-Trust: a shared token/HMAC. Consistency: eventually-consistent (no consensus across
-substrates). Latency: bounded by the peer's sync rate (Apps Script triggers ~1/min).
+**Signed payloads (HMAC).** A shared token authenticates every request; for cross-substrate
+traffic you can additionally require **HMAC-SHA256 signatures**. Start the apiserver with
+`SIGNING_KEY=…` and every POST must carry `X-SNCF-Timestamp` + `X-SNCF-Signature` within
+`SIGN_TTL` seconds (tamper- and replay-resistant). The bridge signs automatically when you pass
+the matching key:
+
+```bash
+SIGNING_KEY=shared-secret WORKBOOK=cluster.xlsx python3 apiserver.py     # peer requires signatures
+python3 bridge.py sync --peer-signing-key shared-secret --local … --peer …   # bridge signs its POSTs
+```
+
+Consistency: eventually-consistent (no consensus across substrates). Latency: bounded by the
+peer's sync rate (Apps Script triggers ~1/min).
 
 ## Roadmap
 
 - `.ods` + Python-UNO runtime; a VBA polling kubelet; a shared-file (no-server) transport.
 - Scheduler: pod anti-affinity / topology spread (bin-packing, affinity, taints, cordon, drain, migrate — done).
-- HMAC signatures on bridge payloads; a rendezvous "Mesh" tab; multi-peer topology.
+- HMAC-signed bridge payloads (done); next: a rendezvous "Mesh" tab and multi-peer topology.
 - Cross-substrate live migration, auto-rollback, and a two-way sync loop are in `bridge.py` (done).
 
 Tracking: [on-prem edition](https://github.com/sncfoundation/sheeternetes/issues/45) ·

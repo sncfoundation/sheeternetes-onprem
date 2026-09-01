@@ -20,18 +20,30 @@ peer's services back — giving cross-substrate service discovery and migration.
                             --local http://localhost:8787 --local-token secret \
                             --peer https://script.google.com/macros/s/XXXX/exec --peer-token secret2
 
-Requires only the standard library (urllib). Trust via a shared token/HMAC.
+Requires only the standard library (urllib). Trust: a shared token, plus optional HMAC
+signing — pass --local-signing-key / --peer-signing-key to sign POSTs so a peer running
+with SIGNING_KEY set accepts them (tamper- and replay-resistant).
 """
-import argparse, json, time, urllib.request, urllib.parse
+import argparse, hashlib, hmac, json, time, urllib.request, urllib.parse, urllib.error
+
+def sign(key, ts, body):
+    """HMAC-SHA256 over 'timestamp.body' — must match apiserver.sign byte-for-byte."""
+    if isinstance(body, str): body = body.encode()
+    return hmac.new(key.encode(), str(ts).encode() + b"." + body, hashlib.sha256).hexdigest()
 
 def get(base, token, kind):
     url = base + ("&" if "?" in base else "?") + urllib.parse.urlencode({"token": token, "kind": kind})
     with urllib.request.urlopen(url, timeout=30) as r:
         return json.loads(r.read()).get("items", [])
 
-def post(base, payload):
-    req = urllib.request.Request(base, data=json.dumps(payload).encode(),
-                                headers={"Content-Type": "application/json"}, method="POST")
+def post(base, payload, key="", now_fn=lambda: int(time.time())):
+    body = json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json"}
+    if key:                                            # sign the request (anti-tamper/replay)
+        ts = str(now_fn())
+        headers["X-SNCF-Timestamp"] = ts
+        headers["X-SNCF-Signature"] = sign(key, ts, body)
+    req = urllib.request.Request(base, data=body, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=30) as r:
         return r.read().decode()
 
@@ -125,13 +137,20 @@ def migrate(deploy, src, dst, *, get_fn=get, post_fn=post, wait=120, poll=3,
 # ---------------------------------------------------------------------- CLI
 
 def _clusters(a):
-    return ({"base": a.local, "token": a.local_token},
-            {"base": a.peer,  "token": a.peer_token})
+    return ({"base": a.local, "token": a.local_token, "key": a.local_signing_key},
+            {"base": a.peer,  "token": a.peer_token,  "key": a.peer_signing_key})
+
+def _signed_post(clusters):
+    """A post() that signs by looking up each cluster's HMAC key by base URL."""
+    keys = {c["base"]: c.get("key", "") for c in clusters}
+    def _p(base, payload): return post(base, payload, key=keys.get(base, ""))
+    return _p
 
 def _endpoints(a):
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--local", required=True); p.add_argument("--local-token", default="CHANGE_ME_super_secret")
     p.add_argument("--peer", required=True);  p.add_argument("--peer-token", default="CHANGE_ME_super_secret")
+    p.add_argument("--local-signing-key", default=""); p.add_argument("--peer-signing-key", default="")
     return p
 
 def main():
@@ -158,33 +177,40 @@ def main():
     if not a.cmd:
         ap.print_help(); return
     local, peer = _clusters(a)
+    spost = _signed_post([local, peer])
 
-    if a.cmd == "status":
-        ld = get(local["base"], local["token"], "deployments")
-        pd = get(peer["base"], peer["token"], "deployments")
-        print(f"[bridge] local: {len(ld)} deployments · peer: {len(pd)} deployments")
-        print("[bridge] federated services:")
-        for name, home in sorted(federated_view(ld, pd).items()):
-            print(f"  {name:20s} -> {home}")
-        if a.push and ld:
-            print("[bridge] publishing local deployments to peer…")
-            print("  ", post(peer["base"], {"token": peer["token"], "action": "apply", "deployments": ld}))
+    try:
+        if a.cmd == "status":
+            ld = get(local["base"], local["token"], "deployments")
+            pd = get(peer["base"], peer["token"], "deployments")
+            print(f"[bridge] local: {len(ld)} deployments · peer: {len(pd)} deployments")
+            print("[bridge] federated services:")
+            for name, home in sorted(federated_view(ld, pd).items()):
+                print(f"  {name:20s} -> {home}")
+            if a.push and ld:
+                print("[bridge] publishing local deployments to peer…")
+                print("  ", spost(peer["base"], {"token": peer["token"], "action": "apply", "deployments": ld}))
 
-    elif a.cmd == "migrate":
-        src = local if a.src == "local" else peer
-        dst = local if a.dst == "local" else peer
-        if a.src == a.dst:
-            print("[migrate] --from and --to must differ"); return
-        res = migrate(a.deploy, src, dst, wait=a.wait, poll=a.poll, skip_wait=a.skip_wait,
-                      rollback_window=a.rollback_window)
-        print("[migrate] " + ("done: " if res["ok"] else "FAILED: ") + json.dumps(res))
+        elif a.cmd == "migrate":
+            src = local if a.src == "local" else peer
+            dst = local if a.dst == "local" else peer
+            if a.src == a.dst:
+                print("[migrate] --from and --to must differ"); return
+            res = migrate(a.deploy, src, dst, post_fn=spost, wait=a.wait, poll=a.poll,
+                          skip_wait=a.skip_wait, rollback_window=a.rollback_window)
+            print("[migrate] " + ("done: " if res["ok"] else "FAILED: ") + json.dumps(res))
 
-    elif a.cmd == "sync":
-        while True:
-            sync_once(local, peer)
-            if not a.interval:
-                break
-            time.sleep(a.interval)
+        elif a.cmd == "sync":
+            while True:
+                sync_once(local, peer, post_fn=spost)
+                if not a.interval:
+                    break
+                time.sleep(a.interval)
+    except urllib.error.HTTPError as e:
+        detail = "signature/auth rejected — check tokens and --*-signing-key" if e.code == 401 else e.reason
+        print(f"[bridge] request failed: HTTP {e.code} — {detail}")
+    except urllib.error.URLError as e:
+        print(f"[bridge] cannot reach a cluster: {e.reason}")
 
 if __name__ == "__main__":
     main()
