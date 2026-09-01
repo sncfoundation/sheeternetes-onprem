@@ -14,6 +14,8 @@
 #   skctl delete <deployment>
 #   skctl cordon|uncordon|drain <node>   # node maintenance (drain evicts pods)
 #   skctl migrate <pod> <node>           # move a pod to a target node
+#   skctl label <node> disk=ssd          # set/remove (disk-) a node label
+#   skctl taint <node> gpu=true:NoSchedule  # add/remove (gpu-) a node taint
 #   skctl tour                      # guided demo
 #
 set -euo pipefail
@@ -58,6 +60,10 @@ case "$cmd" in
   migrate)
     pod="${1:?usage: skctl migrate <pod> <node>}"; node="${2:?target node}"
     api_post "$(jq -n --arg t "$TOKEN" --arg p "$pod" --arg n "$node" '{token:$t, action:"migrate", name:$p, node:$n}')" | jq .
+    ;;
+  label|taint)
+    node="${1:?node}"; spec="${2:?usage: skctl $cmd <node> key=value[:effect] (append - to remove)}"
+    api_post "$(jq -n --arg t "$TOKEN" --arg a "$cmd" --arg n "$node" --arg s "$spec" '{token:$t, action:$a, name:$n, spec:$s}')" | jq .
     ;;
   tour)
     exec "$here/lab/tour.sh"

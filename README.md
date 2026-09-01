@@ -14,8 +14,9 @@ A <a href="https://sncfoundation.github.io">Sheet-Native Computing Foundation</a
 same verb contract as the Google Apps Script apiserver, so `kubelet.sh` and `skctl` point at
 it unchanged. It also **schedules**: on each kubelet heartbeat it **bin-packs** Deployment replicas onto
 Ready, schedulable nodes by `cpu_req`/`mem_req` (a pod that fits nowhere is `Unschedulable`),
-keeps pods sticky to their node, ages out silent nodes after `NODE_TTL` (**failover**), and
-honors `cordon`/`drain`. It hands each node its pod set — so the bundled `kubelet.sh` actually
+keeps pods sticky to their node, ages out silent nodes after `NODE_TTL` (**failover**), honors
+`cordon`/`drain`, and respects **node affinity** (`node_selector` vs node labels) and
+**taints/tolerations**. It hands each node its pod set — so the bundled `kubelet.sh` actually
 runs your containers on bare metal. No internet required (air-gap-friendly): the spreadsheet is
 the store, this process is the apiserver. The scheduler core is a pure, unit-tested function.
 
@@ -40,6 +41,18 @@ make pods                             # watch the scheduler place & run them
 ./skctl drain  a          # evict a's pods onto other nodes, then cordon a
 ./skctl uncordon a        # a is schedulable again
 ./skctl migrate web-1 b   # move one pod to node b (make-before-break)
+./skctl label a disk=ssd  # set a node label (disk- to remove)
+./skctl taint a gpu=true:NoSchedule   # repel pods that don't tolerate it (gpu- to remove)
+```
+
+**Affinity & taints.** A Deployment can pin itself with `node_selector` (e.g. `disk=ssd`) and
+carry `tolerations` (e.g. `gpu=true`) — a pod only lands on a node whose labels satisfy the
+selector and whose `NoSchedule` taints it tolerates. Set these as columns in the Deployments
+tab, or in an applied manifest:
+
+```json
+{ "name": "ml", "image": "tensorflow", "replicas": 1, "cpu_req": 500, "mem_req": 512,
+  "node_selector": "accel=gpu", "tolerations": "gpu=true" }
 ```
 
 - **Excel:** the `.xlsx` opens in Excel; edit workloads in the Deployments tab, the apiserver serves them.
@@ -75,7 +88,7 @@ across substrates). Latency: bounded by the peer's sync rate (Apps Script trigge
 ## Roadmap
 
 - `.ods` + Python-UNO runtime; a VBA polling kubelet; a shared-file (no-server) transport.
-- Scheduler: taints/tolerations and node labels/affinity (bin-packing, cordon, drain, migrate — done).
+- Scheduler: pod anti-affinity / topology spread (bin-packing, affinity, taints, cordon, drain, migrate — done).
 - HMAC signatures on bridge payloads; a rendezvous "Mesh" tab; multi-peer topology.
 - Cross-substrate live migration is in `bridge.py migrate` (done); next: rollback + a two-way sync loop.
 
