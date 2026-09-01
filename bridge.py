@@ -10,8 +10,13 @@ peer's services back — giving cross-substrate service discovery and migration.
   python3 bridge.py status  --local http://localhost:8787 --local-token secret \
                             --peer https://script.google.com/macros/s/XXXX/exec --peer-token secret2
 
-  # live-migrate a deployment across substrates (make-before-break, zero downtime)
-  python3 bridge.py migrate web --from local --to peer \
+  # live-migrate a deployment across substrates (make-before-break, --rollback-window auto-reverts)
+  python3 bridge.py migrate web --from local --to peer --rollback-window 30 \
+                            --local http://localhost:8787 --local-token secret \
+                            --peer https://script.google.com/macros/s/XXXX/exec --peer-token secret2
+
+  # keep both substrates federated (daemon): union-reconcile deployments every 60s
+  python3 bridge.py sync --interval 60 \
                             --local http://localhost:8787 --local-token secret \
                             --peer https://script.google.com/macros/s/XXXX/exec --peer-token secret2
 
@@ -38,14 +43,40 @@ def federated_view(local, peer):
     for d in peer: mesh.setdefault(d.get("name"), "peer")
     return mesh
 
+def plan_sync(local, peer):
+    """Pure: return (to_local, to_peer) — the deployments each side is missing from
+    the other. Union reconciliation; existing deployments are left untouched (the
+    owning side stays authoritative, so this never fights a rename or a scale)."""
+    ln = {d.get("name") for d in local}
+    pn = {d.get("name") for d in peer}
+    to_local = [d for d in peer if d.get("name") not in ln]
+    to_peer  = [d for d in local if d.get("name") not in pn]
+    return to_local, to_peer
+
+def sync_once(local, peer, *, get_fn=get, post_fn=post, log=print):
+    """One reconciliation pass: push each side's missing deployments to the other."""
+    ld = get_fn(local["base"], local["token"], "deployments")
+    pd = get_fn(peer["base"], peer["token"], "deployments")
+    to_local, to_peer = plan_sync(ld, pd)
+    if to_local:
+        post_fn(local["base"], {"token": local["token"], "action": "apply", "deployments": to_local})
+    if to_peer:
+        post_fn(peer["base"], {"token": peer["token"], "action": "apply", "deployments": to_peer})
+    log(f"[sync] +{len(to_local)} -> local, +{len(to_peer)} -> peer")
+    return {"to_local": [d.get("name") for d in to_local],
+            "to_peer": [d.get("name") for d in to_peer]}
+
 def migrate(deploy, src, dst, *, get_fn=get, post_fn=post, wait=120, poll=3,
-            skip_wait=False, sleep_fn=time.sleep, now_fn=time.monotonic, log=print):
+            skip_wait=False, rollback_window=0, sleep_fn=time.sleep,
+            now_fn=time.monotonic, log=print):
     """Live-migrate one deployment from src cluster to dst cluster.
 
     src/dst are {"base":..,"token":..}. Order is make-before-break:
       1) copy the spec and APPLY it on dst (new replicas come up there);
       2) WAIT until dst reports the deployment's pods Running (up to `wait`s);
-      3) only then DELETE it on src (drain the old home).
+      3) only then DELETE it on src (drain the old home);
+      4) if rollback_window>0, WATCH dst for that long — should it degrade below the
+         replica count, restore the spec on src and remove it from dst (auto rollback).
     If dst never becomes Ready, src is left untouched — no downtime, no data path
     ripped out from under traffic. Pure/injectable so it is unit-testable offline.
     """
@@ -74,6 +105,21 @@ def migrate(deploy, src, dst, *, get_fn=get, post_fn=post, wait=120, poll=3,
 
     log(f"[migrate] target Ready — draining {deploy} from source")
     post_fn(src["base"], {"token": src["token"], "action": "delete", "name": deploy})
+
+    if rollback_window > 0 and replicas > 0 and not skip_wait:
+        log(f"[migrate] watching target for {rollback_window}s (rollback armed)…")
+        deadline = now_fn() + rollback_window
+        while now_fn() < deadline:
+            sleep_fn(poll)
+            pods = get_fn(dst["base"], dst["token"], "pods")
+            ready = [p for p in pods if p.get("deployment") == deploy and p.get("phase") == "Running"]
+            if len(ready) < replicas:
+                log(f"[migrate] target degraded ({len(ready)}/{replicas}) — rolling back to source")
+                post_fn(src["base"], {"token": src["token"], "action": "apply", "deployments": [spec]})
+                post_fn(dst["base"], {"token": dst["token"], "action": "delete", "name": deploy})
+                return {"ok": False, "rolled_back": True, "deploy": deploy,
+                        "error": f"target degraded to {len(ready)}/{replicas}; restored on source"}
+
     return {"ok": True, "deploy": deploy, "replicas": replicas}
 
 # ---------------------------------------------------------------------- CLI
@@ -102,6 +148,11 @@ def main():
     m.add_argument("--to", dest="dst", choices=["local", "peer"], default="peer")
     m.add_argument("--wait", type=int, default=120); m.add_argument("--poll", type=int, default=3)
     m.add_argument("--skip-wait", action="store_true", help="don't wait for target readiness (demo w/o kubelets)")
+    m.add_argument("--rollback-window", type=int, default=0,
+                   help="after cutover, watch the target this many seconds and auto-roll-back if it degrades")
+
+    y = sub.add_parser("sync", parents=[common], help="two-way federation sync (union reconcile)")
+    y.add_argument("--interval", type=int, default=0, help="loop every N seconds (0 = one pass)")
 
     a = ap.parse_args()
     if not a.cmd:
@@ -124,8 +175,16 @@ def main():
         dst = local if a.dst == "local" else peer
         if a.src == a.dst:
             print("[migrate] --from and --to must differ"); return
-        res = migrate(a.deploy, src, dst, wait=a.wait, poll=a.poll, skip_wait=a.skip_wait)
+        res = migrate(a.deploy, src, dst, wait=a.wait, poll=a.poll, skip_wait=a.skip_wait,
+                      rollback_window=a.rollback_window)
         print("[migrate] " + ("done: " if res["ok"] else "FAILED: ") + json.dumps(res))
+
+    elif a.cmd == "sync":
+        while True:
+            sync_once(local, peer)
+            if not a.interval:
+                break
+            time.sleep(a.interval)
 
 if __name__ == "__main__":
     main()
