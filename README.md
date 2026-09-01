@@ -57,19 +57,27 @@ apiserver and reconciles against a **rendezvous** peer (a Google Sheets Apps Scr
 another node), giving cross-substrate service discovery.
 
 ```bash
-python3 bridge.py --local http://localhost:8787 --local-token secret \
-                  --peer https://script.google.com/macros/s/XXXX/exec --peer-token secret2 --push
+# federated service view (+ --push to publish local deployments to the peer)
+python3 bridge.py status  --local http://localhost:8787 --local-token secret \
+                          --peer https://script.google.com/macros/s/XXXX/exec --peer-token secret2 --push
+
+# live-migrate a deployment across substrates — make-before-break, zero downtime
+python3 bridge.py migrate web --from local --to peer \
+                          --local http://localhost:8787 --local-token secret \
+                          --peer https://script.google.com/macros/s/XXXX/exec --peer-token secret2
 ```
 
-Trust: a shared token/HMAC. Consistency: eventually-consistent (no consensus across substrates).
-Latency: bounded by the peer's sync rate (Apps Script triggers ~1/min).
+`migrate` copies the deployment spec to the target, **waits until it reports Ready there**, and
+only then drains it from the source — if the target never comes up, the source is left intact
+(no downtime). Trust: a shared token/HMAC. Consistency: eventually-consistent (no consensus
+across substrates). Latency: bounded by the peer's sync rate (Apps Script triggers ~1/min).
 
 ## Roadmap
 
 - `.ods` + Python-UNO runtime; a VBA polling kubelet; a shared-file (no-server) transport.
 - Scheduler: taints/tolerations and node labels/affinity (bin-packing, cordon, drain, migrate — done).
 - HMAC signatures on bridge payloads; a rendezvous "Mesh" tab; multi-peer topology.
-- Cross-substrate live migration in `bridge.py` (local `.xlsx` ↔ Google Sheets).
+- Cross-substrate live migration is in `bridge.py migrate` (done); next: rollback + a two-way sync loop.
 
 Tracking: [on-prem edition](https://github.com/sncfoundation/sheeternetes/issues/45) ·
 [hybrid federation](https://github.com/sncfoundation/sheetmesh/issues/1)
