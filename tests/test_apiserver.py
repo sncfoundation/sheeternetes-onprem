@@ -94,6 +94,34 @@ def test_cpu_used_reflects_allocation(api):
     a = {n["name"]: n for n in api.read_tab("nodes")}["a"]
     assert int(a["cpu_used"]) == 500
 
+def test_label_then_node_selector_places_pod(api):
+    api.upsert_deployment({"name": "gpu", "image": "nginx", "replicas": 1,
+                           "cpu_req": 100, "mem_req": 64, "node_selector": "accel=gpu"})
+    api.heartbeat("a", "1", 4000, 8192, [])
+    api.heartbeat("b", "2", 4000, 8192, [])
+    assert all_pods(api)["gpu-1"]["phase"] == "Unschedulable"   # nothing matches yet
+    api.label_node("b", "accel=gpu")
+    api.heartbeat("b", "2", 4000, 8192, [])
+    assert all_pods(api)["gpu-1"]["node"] == "b"           # now b matches the selector
+
+def test_taint_evicts_untolerating_pods(api):
+    api.upsert_deployment({"name": "web", "image": "nginx", "replicas": 1, "cpu_req": 100, "mem_req": 64})
+    api.heartbeat("a", "1", 4000, 8192, [])
+    api.heartbeat("b", "2", 4000, 8192, [])
+    assert all_pods(api)["web-1"]["node"] == "a"
+    api.taint_node("a", "maint=true:NoSchedule")           # taint reschedules off a
+    assert all_pods(api)["web-1"]["node"] == "b"
+
+def test_taint_removal_restores_schedulability(api):
+    assert api.taint_node("a", "x=y:NoSchedule") == "not found"   # no such node yet
+    api.heartbeat("a", "1", 4000, 8192, [])
+    assert api.taint_node("a", "x=y:NoSchedule") == "ok"
+    nodes = {n["name"]: n for n in api.read_tab("nodes")}
+    assert "x=y:NoSchedule" in str(nodes["a"]["taints"])
+    assert api.taint_node("a", "x-") == "ok"               # remove by key
+    nodes = {n["name"]: n for n in api.read_tab("nodes")}
+    assert "x=y" not in str(nodes["a"]["taints"] or "")
+
 def test_schema_upgrade_adds_schedulable(tmp_path):
     # build an OLD workbook: Nodes without the schedulable column
     import openpyxl
