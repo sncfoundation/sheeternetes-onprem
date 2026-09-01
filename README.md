@@ -82,15 +82,28 @@ python3 bridge.py migrate web --from local --to peer \
 
 `migrate` copies the deployment spec to the target, **waits until it reports Ready there**, and
 only then drains it from the source — if the target never comes up, the source is left intact
-(no downtime). Trust: a shared token/HMAC. Consistency: eventually-consistent (no consensus
-across substrates). Latency: bounded by the peer's sync rate (Apps Script triggers ~1/min).
+(no downtime). With `--rollback-window N` it then watches the target for `N` seconds and, if it
+degrades below the replica count, **automatically restores the deployment on the source** and
+removes it from the target.
+
+`sync` keeps both substrates federated: a union reconcile that pushes each side's missing
+deployments to the other (the owning side stays authoritative, so it never fights a rename or a
+scale). Run it once, or as a daemon with `--interval N`:
+
+```bash
+python3 bridge.py sync --interval 60 --local http://localhost:8787 --local-token secret \
+                       --peer https://script.google.com/macros/s/XXXX/exec --peer-token secret2
+```
+
+Trust: a shared token/HMAC. Consistency: eventually-consistent (no consensus across
+substrates). Latency: bounded by the peer's sync rate (Apps Script triggers ~1/min).
 
 ## Roadmap
 
 - `.ods` + Python-UNO runtime; a VBA polling kubelet; a shared-file (no-server) transport.
 - Scheduler: pod anti-affinity / topology spread (bin-packing, affinity, taints, cordon, drain, migrate — done).
 - HMAC signatures on bridge payloads; a rendezvous "Mesh" tab; multi-peer topology.
-- Cross-substrate live migration is in `bridge.py migrate` (done); next: rollback + a two-way sync loop.
+- Cross-substrate live migration, auto-rollback, and a two-way sync loop are in `bridge.py` (done).
 
 Tracking: [on-prem edition](https://github.com/sncfoundation/sheeternetes/issues/45) ·
 [hybrid federation](https://github.com/sncfoundation/sheetmesh/issues/1)
