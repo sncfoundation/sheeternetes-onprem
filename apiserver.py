@@ -5,7 +5,7 @@ spreadsheet (Excel .xlsx). Same verb contract as the Google Apps Script apiserve
 so kubelet.sh / skctl point at it unchanged. Air-gap-friendly: no internet required.
 
   WORKBOOK=cluster.xlsx TOKEN=secret python3 apiserver.py            # serve on :8787
-  GET  /?token=..&kind=pods|nodes|deployments|events|images|layers   -> {"items":[...]}
+  GET  /?token=..&kind=pods|nodes|deployments|events|images|layers|secrets   -> {"items":[...]}
   POST /  {"token":..,"action":"apply|scale|delete|cordon|uncordon|drain|migrate|label|taint", ...}
   POST /  {"token":..,"node":..,"ip":..,"cpu_total":..,"mem_total":..,"pods":[...]}  # kubelet heartbeat
 
@@ -32,13 +32,15 @@ NODE_TTL = int(os.environ.get("NODE_TTL", "30"))   # seconds before a silent nod
 SIGNING_KEY = os.environ.get("SIGNING_KEY", "")    # if set, POSTs must carry a valid HMAC
 SIGN_TTL = int(os.environ.get("SIGN_TTL", "300"))  # max clock skew (s) for a signed request
 TABS = {
-    "Deployments": ["name", "image", "replicas", "cpu_req", "mem_req", "command", "node_selector", "tolerations"],
+    "Deployments": ["name", "image", "replicas", "cpu_req", "mem_req", "command", "node_selector", "tolerations", "env", "secret_files"],
     "Nodes": ["name", "ip", "cpu_total", "cpu_used", "mem_total", "status", "last_heartbeat", "schedulable", "labels", "taints"],
     "Pods": ["name", "deployment", "node", "phase", "container_id"],
     "Events": ["ts", "kind", "object", "message"],
     # SICF native image store (see sci: SICF v0.1). Populated by `sheetbuild import`.
     "Images": ["name", "digest", "config", "layers", "created", "size"],
     "Layers": ["digest", "ordinal", "media_type", "data"],
+    # Secrets: base64 data mounted into pods as files (secret_files on a Deployment).
+    "Secrets": ["name", "data"],
 }
 
 # ---------------------------------------------------------------- workbook I/O
@@ -82,7 +84,7 @@ def _dicts(ws):
 
 def read_tab(kind):
     tab = {"pods": "Pods", "nodes": "Nodes", "deployments": "Deployments", "events": "Events",
-           "images": "Images", "layers": "Layers"}.get(kind)
+           "images": "Images", "layers": "Layers", "secrets": "Secrets"}.get(kind)
     if not tab: return None
     return _dicts(_wb()[tab])
 
@@ -290,7 +292,8 @@ def schedule(deployments, nodes, existing, exclude=frozenset()):
             if chosen: place(chosen, cpu_req, mem_req)
             desired[pname] = {"deployment": name, "node": chosen,
                               "image": dep.get("image"), "command": dep.get("command") or "",
-                              "cpu_req": cpu_req, "mem_req": mem_req}
+                              "cpu_req": cpu_req, "mem_req": mem_req,
+                              "env": dep.get("env") or "", "secret_files": dep.get("secret_files") or ""}
     return desired, alloc
 
 def _load_nodes(ns, now):
@@ -378,7 +381,8 @@ def heartbeat(node, ip, cpu_total, mem_total, reported):
 
     # 4) this node's marching orders: run what's assigned here, stop the rest.
     out = [{"name": p, "desired": "Running", "image": d["image"], "command": d["command"],
-            "cpu_req": d["cpu_req"], "mem_req": d["mem_req"], "deployment": d["deployment"]}
+            "cpu_req": d["cpu_req"], "mem_req": d["mem_req"], "deployment": d["deployment"],
+            "env": d.get("env", ""), "secret_files": d.get("secret_files", "")}
            for p, d in desired.items() if d["node"] == node]
     for pname in rep:
         d = desired.get(pname)

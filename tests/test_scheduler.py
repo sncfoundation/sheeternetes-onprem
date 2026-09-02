@@ -100,6 +100,14 @@ def test_toleration_allows_scheduling_onto_taint():
                           [node("a", taints=[("gpu", "true", "NoSchedule")])], existing={})
     assert placed(desired) == {"ml-1": "a"}                # tolerated -> lands there
 
+def test_env_and_secret_files_passthrough():
+    d = {"name": "op", "image": "x", "replicas": 1, "cpu_req": 100, "mem_req": 64,
+         "env": "SHEETSOP_CONTROL=abc,K=v", "secret_files": "creds:/creds/creds.json"}
+    desired, _ = schedule([d], [node("a")], existing={})
+    p = desired["op-1"]
+    assert p["env"] == "SHEETSOP_CONTROL=abc,K=v"
+    assert p["secret_files"] == "creds:/creds/creds.json"
+
 def test_sticky_pod_moves_when_node_label_no_longer_matches():
     existing = {"web-1": {"node": "a"}}
     desired, _ = schedule([dep("web", replicas=1, node_selector={"disk": "ssd"})],
