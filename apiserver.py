@@ -5,7 +5,7 @@ spreadsheet (Excel .xlsx). Same verb contract as the Google Apps Script apiserve
 so kubelet.sh / skctl point at it unchanged. Air-gap-friendly: no internet required.
 
   WORKBOOK=cluster.xlsx TOKEN=secret python3 apiserver.py            # serve on :8787
-  GET  /?token=..&kind=pods|nodes|deployments|events   -> {"items":[...]}
+  GET  /?token=..&kind=pods|nodes|deployments|events|images|layers   -> {"items":[...]}
   POST /  {"token":..,"action":"apply|scale|delete|cordon|uncordon|drain|migrate|label|taint", ...}
   POST /  {"token":..,"node":..,"ip":..,"cpu_total":..,"mem_total":..,"pods":[...]}  # kubelet heartbeat
 
@@ -36,6 +36,9 @@ TABS = {
     "Nodes": ["name", "ip", "cpu_total", "cpu_used", "mem_total", "status", "last_heartbeat", "schedulable", "labels", "taints"],
     "Pods": ["name", "deployment", "node", "phase", "container_id"],
     "Events": ["ts", "kind", "object", "message"],
+    # SICF native image store (see sci: SICF v0.1). Populated by `sheetbuild import`.
+    "Images": ["name", "digest", "config", "layers", "created", "size"],
+    "Layers": ["digest", "ordinal", "media_type", "data"],
 }
 
 # ---------------------------------------------------------------- workbook I/O
@@ -78,7 +81,8 @@ def _dicts(ws):
     return [dict(zip(headers, r)) for r in rows[1:] if r and r[0] not in (None, "")]
 
 def read_tab(kind):
-    tab = {"pods": "Pods", "nodes": "Nodes", "deployments": "Deployments", "events": "Events"}.get(kind)
+    tab = {"pods": "Pods", "nodes": "Nodes", "deployments": "Deployments", "events": "Events",
+           "images": "Images", "layers": "Layers"}.get(kind)
     if not tab: return None
     return _dicts(_wb()[tab])
 

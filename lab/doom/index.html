@@ -1,0 +1,9 @@
+<!doctype html><html><head><meta charset="utf-8"><title>DOOM on Sheeternetes</title>
+<style>body{margin:0;background:#000}#c{width:100vw;height:100vh}</style>
+<script src="https://js-dos.com/6.22/current/js-dos.js"></script></head>
+<body><canvas id="c"></canvas>
+<script>
+  // js-dos boots the shareware WAD. (Air-gapped? vendor js-dos.js next to this file.)
+  Dos(document.getElementById("c")).ready((fs, main) =>
+    fs.extract("https://js-dos.com/6.22/current/test/doom.zip").then(() => main(["-c","DOOM.EXE"])));
+</script></body></html>

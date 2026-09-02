@@ -75,6 +75,12 @@ while true; do
         cpu="$(echo "$pod"   | jq -r '.cpu_req // 100')"
         mem="$(echo "$pod"   | jq -r '.mem_req // 64')"
         deploy="$(echo "$pod" | jq -r '.deployment // empty')"
+        # SICF native: an image stored IN the spreadsheet. Resolve it to a local
+        # docker image (fetch layers from the apiserver, verify digests, docker load).
+        case "$image" in
+          sicf:*) image="$(python3 "$here/sicf.py" "$WEBAPP_URL" "$TOKEN" "$image")" \
+                    || { echo "[kubelet] FAILED to resolve $image"; continue; } ;;
+        esac
         # millicores -> docker's fractional --cpus, locale-independent (no awk)
         cpus="$((cpu / 1000)).$(printf '%03d' "$((cpu % 1000))")"
         # Sheetlium: join the shared net; alias = deployment name (the Service)
