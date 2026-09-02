@@ -1,0 +1,5 @@
+{
+  "deployments": [
+    { "name": "doom", "image": "sicf:doom:shareware", "replicas": 1, "cpu_req": 200, "mem_req": 128 }
+  ]
+}

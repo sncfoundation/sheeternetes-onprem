@@ -55,6 +55,14 @@ tab, or in an applied manifest:
   "node_selector": "accel=gpu", "tolerations": "gpu=true" }
 ```
 
+**SICF native images (the image lives in the sheet).** Besides normal OCI references
+(`image: nginx:alpine`, pulled from a registry), a workload can run an image stored **inside the
+workbook** — `image: sicf:<name>`. Pack one with [`sheetbuild`](https://github.com/sncfoundation/sci)
+(`sheetbuild import doom.tar --store cluster.xlsx`); the kubelet then resolves `sicf:` via
+`sicf.py` — it fetches the layers from the apiserver, verifies every sha256, `docker load`s the
+image, and runs it. Execution stays on the node; the sheet only stores + schedules. See
+[`lab/doom/`](lab/doom/) for the full "run DOOM from a spreadsheet" walkthrough.
+
 - **Excel:** the `.xlsx` opens in Excel; edit workloads in the Deployments tab, the apiserver serves them.
 - **LibreOffice Calc:** openpyxl reads `.xlsx` only — in Calc do **Save As → Excel 2007-365 (.xlsx)**.
   (Native `.ods` + Python-UNO is on the roadmap.)
