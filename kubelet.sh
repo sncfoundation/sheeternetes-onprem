@@ -21,7 +21,7 @@ WEBAPP_URL="${WEBAPP_URL:?set WEBAPP_URL (local apiserver URL, e.g. http://local
 TOKEN="${TOKEN:-CHANGE_ME_super_secret}"
 NODE_NAME="${NODE_NAME:-$(hostname)}"
 # Linux: hostname -I; macOS: ipconfig; fall back to loopback if both are empty.
-NODE_IP="${NODE_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
+NODE_IP="${NODE_IP:-$(hostname -I 2>/dev/null | awk '{print $1}' || true)}"
 NODE_IP="${NODE_IP:-$(ipconfig getifaddr en0 2>/dev/null || true)}"
 NODE_IP="${NODE_IP:-127.0.0.1}"
 CPU_TOTAL="${CPU_TOTAL:-$(( $(nproc 2>/dev/null || echo 2) * 1000 ))}"   # millicores
@@ -35,6 +35,7 @@ echo "[kubelet] node=$NODE_NAME ip=$NODE_IP cpu=${CPU_TOTAL}m mem=${MEM_TOTAL}Mi
 # real multi-host would need an overlay network).
 SK_NET="${SK_NET:-sheeternetes}"
 docker network inspect "$SK_NET" >/dev/null 2>&1 || docker network create "$SK_NET" >/dev/null 2>&1 || true
+SK_SECRET_DIR="${SK_SECRET_DIR:-${TMPDIR:-/tmp}/sk-secrets}"; mkdir -p "$SK_SECRET_DIR"
 
 # name of the docker container backing a pod
 cname() { echo "sk_$1"; }
@@ -86,6 +87,31 @@ while true; do
         # Sheetlium: join the shared net; alias = deployment name (the Service)
         net_args=(--network "$SK_NET")
         [ -n "$deploy" ] && net_args+=(--network-alias "$deploy")
+        # env: comma-separated K=V pairs from the Deployment
+        env_args=()
+        env_spec="$(echo "$pod" | jq -r '.env // ""')"
+        if [ -n "$env_spec" ] && [ "$env_spec" != "null" ]; then
+          oldIFS="$IFS"; IFS=','
+          for kv in $env_spec; do [ -n "$kv" ] && env_args+=(-e "$kv"); done
+          IFS="$oldIFS"
+        fi
+        # secret_files: "secretName:/path,..." -> fetch Secret data, write to a node file, mount ro
+        sec_args=()
+        sec_spec="$(echo "$pod" | jq -r '.secret_files // ""')"
+        if [ -n "$sec_spec" ] && [ "$sec_spec" != "null" ]; then
+          secrets_json="$(curl -fsSL -m 30 "$WEBAPP_URL?token=$TOKEN&kind=secrets" 2>/dev/null || echo '{"items":[]}')"
+          oldIFS="$IFS"; IFS=','
+          for m in $sec_spec; do
+            sname="${m%%:*}"; spath="${m#*:}"
+            [ -z "$sname" ] || [ "$sname" = "$spath" ] && continue
+            data="$(echo "$secrets_json" | jq -r --arg n "$sname" '.items[]|select(.name==$n)|.data')"
+            [ -z "$data" ] || [ "$data" = "null" ] && { echo "[kubelet] secret '$sname' not found"; continue; }
+            sfile="$SK_SECRET_DIR/${name}.${sname}"
+            printf '%s' "$data" | base64 -d > "$sfile" 2>/dev/null || echo "[kubelet] bad base64 for secret $sname"
+            sec_args+=(-v "$sfile:$spath:ro")
+          done
+          IFS="$oldIFS"
+        fi
         echo "[kubelet] run $name ($image)"
         docker rm -f "$cn" >/dev/null 2>&1 || true
         # command (if any) is run through a shell so quoting/loops survive
@@ -93,13 +119,15 @@ while true; do
           docker run -d --name "$cn" \
             --label sheeternetes=1 --label "sheeternetes.pod=$name" \
             --label "sheeternetes.node=$NODE_NAME" \
-            "${net_args[@]}" --cpus "$cpus" --memory "${mem}m" \
+            "${net_args[@]}" ${env_args[@]+"${env_args[@]}"} ${sec_args[@]+"${sec_args[@]}"} \
+            --cpus "$cpus" --memory "${mem}m" \
             "$image" sh -c "$cmd" >/dev/null || echo "[kubelet] FAILED to start $name"
         else
           docker run -d --name "$cn" \
             --label sheeternetes=1 --label "sheeternetes.pod=$name" \
             --label "sheeternetes.node=$NODE_NAME" \
-            "${net_args[@]}" --cpus "$cpus" --memory "${mem}m" \
+            "${net_args[@]}" ${env_args[@]+"${env_args[@]}"} ${sec_args[@]+"${sec_args[@]}"} \
+            --cpus "$cpus" --memory "${mem}m" \
             "$image" >/dev/null || echo "[kubelet] FAILED to start $name"
         fi
       fi
