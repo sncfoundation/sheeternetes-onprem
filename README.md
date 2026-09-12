@@ -117,6 +117,65 @@ python3 bridge.py sync --peer-signing-key shared-secret --local … --peer …  
 Consistency: eventually-consistent (no consensus across substrates). Latency: bounded by the
 peer's sync rate (Apps Script triggers ~1/min).
 
+## Cross-substrate networking (Sheetwire)
+
+Federation's hard part isn't discovery, it's **reachability**: two clusters behind NAT can't be
+dialed inbound, but both can reach a shared Google Sheet. So `sheetwire.py` makes the sheet the
+wire — a userspace TCP relay that serializes byte streams into cells and back. Neither side ever
+opens a port; both only write and read the sheet.
+
+```bash
+# side B (hosts the service): read frames, dial the local Service
+sheetwire.py serve  --wire <shared-sheet-id> --service web --target 127.0.0.1:8080
+
+# side A (wants to reach it): expose it as a local port
+sheetwire.py expose --wire <shared-sheet-id> --service web --listen 127.0.0.1:9080
+
+# then, on side A:  curl localhost:9080  reaches side B's web — through the cells
+```
+
+The `Wire` tab is append-only frames: `conn | kind(open|data|close) | dir(a2b|b2a) | service |
+payload(base64)`. Outbound frames are batched per tick to stay under the Sheets write quota
+(~60/min/user), which makes this a **low-throughput, service-to-service** pipe (cross-cluster API
+calls) — not a bulk data path.
+
+**Validated two-site:** a `curl` on one host reached an HTTP service on a *different physical host*
+purely through a shared sheet, with no inbound ports on either side. The whole TCP exchange
+(`open → GET → 200 OK → body → close`) is visible as rows in the `Wire` tab.
+
+## Stretching a cluster (pool the peer's capacity)
+
+`bridge.py stretch` treats both clusters' nodes as one pool: it fills the local cluster first, then
+**orders the remaining replicas from the peer**. From the outside it's one deployment spanning
+on-prem Excel + Google Sheets; Sheetwire stitches its Service across substrates, and `migrate`
+moves replicas between them.
+
+```bash
+# fill local, order the rest from the peer (add --plan to see the split without applying)
+python3 bridge.py stretch web --replicas 10 --cpu 300 \
+    --local http://localhost:8787 --local-token secret \
+    --peer  https://script.google.com/macros/s/XXXX/exec --peer-token secret2
+# -> web x10 @ 300m | local free 1000m -> 3, ordered from peer -> 7
+```
+
+## A sheet-native runtime (WASM in a cell)
+
+Docker is only the *executor*; the more sheet-native runtime is **WASM/WASI**. A `.wasm` module is
+small enough to live entirely in a cell (base64 + sha256), and a WASI runtime needs nothing but the
+bytes — no Docker daemon, no registry. `wasmlet.py` pulls a module out of a spreadsheet cell,
+verifies its digest, and runs it with `wasmtime`:
+
+```bash
+wasmlet.py --store <sheet-id> --name hello:v1     # pull from a cell, verify sha256, run — no Docker
+# -> pulled hello:v1 from a spreadsheet cell (158 bytes), sha256 OK
+# -> hello from a spreadsheet cell
+```
+
+**Honest scope:** the whole federation stack above has been exercised on real Google Sheets and,
+for Sheetwire, across two physical hosts. Everything else (stretch across a live Excel↔Sheets pair,
+migration) has been demonstrated with real clusters but on a single machine; a full multi-host
+production run is the next validation. Do not run production on any of this. It reconciles.
+
 ## Roadmap
 
 - `.ods` + Python-UNO runtime; a VBA polling kubelet; a shared-file (no-server) transport.

@@ -134,6 +134,39 @@ def migrate(deploy, src, dst, *, get_fn=get, post_fn=post, wait=120, poll=3,
 
     return {"ok": True, "deploy": deploy, "replicas": replicas}
 
+def _free_cpu(nodes):
+    """Schedulable free CPU (millicores) on a cluster's Ready nodes."""
+    free = 0
+    for n in nodes:
+        fresh = str(n.get("status", "")).lower() not in ("notready", "")
+        sched = str(n.get("schedulable", "true")).lower() not in ("false", "0", "no")
+        if fresh and sched:
+            free += max(0, int(n.get("cpu_total") or 0) - int(n.get("cpu_used") or 0))
+    return free
+
+def stretch(deploy, replicas, cpu_req, mem_req, image, command, local, peer,
+            *, get_fn=get, post_fn=post, apply=True, log=print):
+    """Treat both clusters as one capacity pool: fill the local cluster first, then
+    ORDER the remaining replicas from the peer. The two clusters run the same-named
+    deployment (its Service is stitched across substrates by sheetwire), so from the
+    outside it is one stretched workload spanning on-prem + Google Sheets."""
+    ln = get_fn(local["base"], local["token"], "nodes")
+    pn = get_fn(peer["base"], peer["token"], "nodes")
+    lfit = min(replicas, _free_cpu(ln) // max(1, cpu_req))
+    local_count = max(0, min(replicas, lfit))
+    peer_count = replicas - local_count
+    log(f"[stretch] {deploy} x{replicas} @ {cpu_req}m  |  local free {_free_cpu(ln)}m -> {local_count}, "
+        f"ordered from peer -> {peer_count}")
+    spec = lambda n: {"name": deploy, "image": image, "replicas": n, "cpu_req": cpu_req,
+                      "mem_req": mem_req, "command": command or ""}
+    if apply:
+        post_fn(local["base"], {"token": local["token"], "action": "apply", "deployments": [spec(local_count)]})
+        post_fn(peer["base"], {"token": peer["token"], "action": "apply", "deployments": [spec(peer_count)]})
+        log(f"[stretch] applied: {local_count} local + {peer_count} peer")
+    return {"ok": peer_count == 0 or peer_count > 0, "deploy": deploy, "replicas": replicas,
+            "local": local_count, "peer": peer_count,
+            "local_free_cpu": _free_cpu(ln), "peer_free_cpu": _free_cpu(pn)}
+
 # ---------------------------------------------------------------------- CLI
 
 def _clusters(a):
@@ -173,6 +206,15 @@ def main():
     y = sub.add_parser("sync", parents=[common], help="two-way federation sync (union reconcile)")
     y.add_argument("--interval", type=int, default=0, help="loop every N seconds (0 = one pass)")
 
+    st = sub.add_parser("stretch", parents=[common],
+                        help="pool both clusters' capacity: fill local, order the rest from the peer")
+    st.add_argument("deploy")
+    st.add_argument("--replicas", type=int, required=True)
+    st.add_argument("--cpu", type=int, default=100, help="cpu_req millicores per replica")
+    st.add_argument("--mem", type=int, default=64)
+    st.add_argument("--image", default="nginx:alpine"); st.add_argument("--command", default="")
+    st.add_argument("--plan", action="store_true", help="show the split without applying")
+
     a = ap.parse_args()
     if not a.cmd:
         ap.print_help(); return
@@ -206,6 +248,11 @@ def main():
                 if not a.interval:
                     break
                 time.sleep(a.interval)
+
+        elif a.cmd == "stretch":
+            res = stretch(a.deploy, a.replicas, a.cpu, a.mem, a.image, a.command,
+                          local, peer, post_fn=spost, apply=not a.plan)
+            print("[stretch] " + json.dumps(res))
     except urllib.error.HTTPError as e:
         detail = "signature/auth rejected — check tokens and --*-signing-key" if e.code == 401 else e.reason
         print(f"[bridge] request failed: HTTP {e.code} — {detail}")
