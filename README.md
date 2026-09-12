@@ -158,6 +158,31 @@ python3 bridge.py stretch web --replicas 10 --cpu 300 \
 # -> web x10 @ 300m | local free 1000m -> 3, ordered from peer -> 7
 ```
 
+## Sheetmesh — N clusters over a rendezvous sheet
+
+`bridge.py` federates two clusters point-to-point. `sheetmesh.py` generalises that to **many**
+clusters with a shared **Mesh** spreadsheet as the rendezvous. It reuses Sheeternetes' own
+control model — nobody pushes work to anyone else (which would put every cluster's token in a
+shared sheet). Instead each cluster runs an **agent** that publishes its capacity and reconciles
+the assignments addressed to *it*, with its own local token; a **stretch** planner reads the
+whole mesh's free capacity and writes a desired split — no tokens needed to plan.
+
+```bash
+# on each cluster: publish capacity + run its own assignments
+sheetmesh.py agent --mesh <sheet-id> --name A --apiserver http://localhost:8801 --token secret --interval 10
+
+# from anywhere: see the mesh, or spill a deployment across it by capacity
+sheetmesh.py view    --mesh <sheet-id>
+sheetmesh.py stretch web --replicas 20 --cpu 300 --mesh <sheet-id> --home A
+# -> web x20 across 3 live members: A <- 3 (home, full), C <- 17 (most free); each agent applies its share
+```
+
+The Mesh sheet has two tabs: `Members` (an append-only heartbeat log — each agent appends only
+its own row, so concurrent writers never clobber each other; readers dedup by newest `last_seen`)
+and `Assignments` (the desired split, written by the planner, reconciled by each member).
+Demonstrated with three clusters. Next: Sheetwire mesh routing (a service resolves to whichever
+member hosts it) and multi-substrate members (Excel + Google in one mesh).
+
 ## A sheet-native runtime (WASM in a cell)
 
 Docker is only the *executor*; the more sheet-native runtime is **WASM/WASI**. A `.wasm` module is
