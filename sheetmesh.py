@@ -33,8 +33,10 @@ from googleapiclient.discovery import build
 
 MEMBERS = "Members"
 ASSIGN = "Assignments"
+CLUSTERS = "Clusters"
 MEMBER_COLS = ["name", "apiserver", "cpu_total", "cpu_free", "last_seen"]
 ASSIGN_COLS = ["deploy", "member", "replicas", "cpu", "mem", "image"]
+CLUSTER_COLS = ["name", "provisioner", "node_cpu", "node_mem", "port", "state"]
 MEMBER_TTL = int(os.environ.get("MESH_TTL", "60"))   # a member is stale after this many seconds
 
 def _svc():
@@ -47,7 +49,7 @@ def _svc():
 def _ensure(ss, sid):
     from googleapiclient.errors import HttpError
     have = {s["properties"]["title"] for s in ss.get(spreadsheetId=sid).execute()["sheets"]}
-    for tab, cols in ((MEMBERS, MEMBER_COLS), (ASSIGN, ASSIGN_COLS)):
+    for tab, cols in ((MEMBERS, MEMBER_COLS), (ASSIGN, ASSIGN_COLS), (CLUSTERS, CLUSTER_COLS)):
         if tab not in have:
             try: ss.batchUpdate(spreadsheetId=sid, body={"requests": [{"addSheet": {"properties": {"title": tab}}}]}).execute()
             except HttpError as e:
@@ -111,6 +113,72 @@ def agent(sid, name, base, token, interval):
             break
         time.sleep(interval)
 
+# ------------------------------------------------------------------ provisioner
+def _seed_cluster(path, node, cpu, mem):
+    import openpyxl, apiserver as core
+    wb = openpyxl.Workbook(); wb.remove(wb.active)
+    for t, c in core.TABS.items():
+        wb.create_sheet(t).append(c)
+    wb["Nodes"].append([node + "-node", "10.9.0.1", cpu, 0, mem, "Ready", int(time.time()), True, "", ""])
+    wb.save(path)
+
+def _set_cluster(ss, sid, name, port, state):
+    rows = ss.values().get(spreadsheetId=sid, range=f"{CLUSTERS}!A1:F5000").execute().get("values", [])
+    for i, r in enumerate(rows[1:], start=2):   # row index in the sheet (header is row 1)
+        if r and r[0] == name:
+            ss.values().update(spreadsheetId=sid, range=f"{CLUSTERS}!E{i}:F{i}",
+                valueInputOption="RAW", body={"values": [[port, state]]}).execute()
+            return
+
+def provisioner(sid, host, token, base_port, interval):
+    """Watch the Clusters tab and bring up the on-prem clusters declared for THIS host —
+    a spreadsheet-driven Cluster API. Each cluster it owns is a local apiserver over a fresh
+    .xlsx; the provisioner also acts as the mesh agent for them (publish + reconcile)."""
+    import subprocess
+    ss = _svc(); _ensure(ss, sid)
+    here = os.path.dirname(os.path.abspath(__file__))
+    running = {}   # name -> {"proc", "port"}
+    print(f"[provisioner] host={host} watching Clusters in mesh {sid}")
+    while True:
+        desired = [r for r in _records(ss, sid, CLUSTERS, CLUSTER_COLS) if r.get("provisioner") == host]
+        used = {info["port"] for info in running.values()}
+        for r in desired:
+            name = r["name"]
+            if name in running:
+                continue
+            port = base_port
+            while port in used: port += 1
+            used.add(port)
+            path = f"/tmp/mesh_{name}.xlsx"
+            _seed_cluster(path, name, int(r.get("node_cpu") or 1000), int(r.get("node_mem") or 8192))
+            proc = subprocess.Popen(["python3", "apiserver.py"], cwd=here,
+                env={**os.environ, "WORKBOOK": path, "TOKEN": token, "PORT": str(port)},
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            running[name] = {"proc": proc, "port": port}
+            time.sleep(1)
+            _set_cluster(ss, sid, name, port, "Running")
+            print(f"[provisioner] brought up on-prem cluster {name} on :{port} "
+                  f"(node {r.get('node_cpu')}m) — declared from the sheet")
+        # agent duties for the clusters this host owns
+        for name, info in running.items():
+            base = f"http://localhost:{info['port']}"
+            try:
+                tot, free = _free_cpu(api_get(base, token, "nodes"))
+                ss.values().append(spreadsheetId=sid, range=f"{MEMBERS}!A1", valueInputOption="RAW",
+                    insertDataOption="INSERT_ROWS",
+                    body={"values": [[name, base, tot, free, int(time.time())]]}).execute()
+                mine = [a for a in _records(ss, sid, ASSIGN, ASSIGN_COLS) if a["member"] == name]
+                deps = [{"name": a["deploy"], "image": a.get("image") or "nginx:alpine",
+                         "replicas": int(a.get("replicas") or 0), "cpu_req": int(a.get("cpu") or 100),
+                         "mem_req": int(a.get("mem") or 64), "command": ""} for a in mine]
+                if deps:
+                    api_post(base, {"token": token, "action": "apply", "deployments": deps})
+            except Exception as e:
+                print(f"  [provisioner] {name}: {e}")
+        if interval <= 0:
+            break
+        time.sleep(interval)
+
 # ------------------------------------------------------------------ planner
 def live_members(ss, sid):
     now = int(time.time())
@@ -162,7 +230,15 @@ def stretch(sid, deploy, replicas, cpu, mem, image, home, apply=True):
 def view(sid):
     ss = _svc(); _ensure(ss, sid)
     members = live_members(ss, sid); assigns = _records(ss, sid, ASSIGN, ASSIGN_COLS)
-    print(f"=== Mesh {sid} ===\nMembers:")
+    clusters = _records(ss, sid, CLUSTERS, CLUSTER_COLS)
+    if clusters:
+        print(f"=== Mesh {sid} ===\nDeclared clusters:")
+        for c in clusters:
+            print(f"  {c['name']:10} provisioner={c.get('provisioner',''):8} node {c.get('node_cpu','?')}m "
+                  f"-> {c.get('state','') or 'Pending'} {(':'+c['port']) if c.get('port') else ''}")
+        print("Members:")
+    else:
+        print(f"=== Mesh {sid} ===\nMembers:")
     for m in members:
         flag = "" if m["fresh"] else "  (stale)"
         print(f"  {m['name']:10} {m['apiserver']:32} free {m['cpu_free']}/{m['cpu_total']}m{flag}")
@@ -183,10 +259,14 @@ def main():
     st.add_argument("--mem", type=int, default=64); st.add_argument("--image", default="nginx:alpine")
     st.add_argument("--home", required=True, help="the cluster to fill first")
     st.add_argument("--plan", action="store_true", help="show the split without writing it")
+    pv = sub.add_parser("provisioner"); pv.add_argument("--mesh", required=True); pv.add_argument("--host", required=True)
+    pv.add_argument("--token", default="secret"); pv.add_argument("--base-port", type=int, default=8900)
+    pv.add_argument("--interval", type=int, default=8)
     vw = sub.add_parser("view"); vw.add_argument("--mesh", required=True)
     a = ap.parse_args()
     if a.cmd == "agent":    agent(a.mesh, a.name, a.apiserver, a.token, a.interval)
     elif a.cmd == "stretch": stretch(a.mesh, a.deploy, a.replicas, a.cpu, a.mem, a.image, a.home, apply=not a.plan)
+    elif a.cmd == "provisioner": provisioner(a.mesh, a.host, a.token, a.base_port, a.interval)
     elif a.cmd == "view":    view(a.mesh)
     else: ap.print_help()
 

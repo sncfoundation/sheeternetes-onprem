@@ -177,11 +177,31 @@ sheetmesh.py stretch web --replicas 20 --cpu 300 --mesh <sheet-id> --home A
 # -> web x20 across 3 live members: A <- 3 (home, full), C <- 17 (most free); each agent applies its share
 ```
 
-The Mesh sheet has two tabs: `Members` (an append-only heartbeat log — each agent appends only
-its own row, so concurrent writers never clobber each other; readers dedup by newest `last_seen`)
-and `Assignments` (the desired split, written by the planner, reconciled by each member).
-Demonstrated with three clusters. Next: Sheetwire mesh routing (a service resolves to whichever
-member hosts it) and multi-substrate members (Excel + Google in one mesh).
+### Provisioning on-prem clusters *from* the sheet
+
+You can also declare clusters in the Mesh sheet and have them brought up on-prem — a
+spreadsheet-driven Cluster API. Add a row to the `Clusters` tab (`name | provisioner | node_cpu
+| node_mem | port | state`) and a **provisioner** running on that host reconciles it into a real
+local cluster: it seeds an `.xlsx`, starts an `apiserver` for it, marks the row `Running`, and
+registers it into the mesh. It also serves as the mesh agent for the clusters it owns.
+
+```bash
+# on the on-prem host: watch the sheet, bring up the clusters declared for this host
+sheetmesh.py provisioner --mesh <sheet-id> --host mac --base-port 8920 --interval 8
+
+# declaring `edge-1` (2000m) and `edge-2` (5000m) in the Clusters tab brings them up:
+#   edge-1  provisioner=mac  node 2000m -> Running :8920
+#   edge-2  provisioner=mac  node 5000m -> Running :8921
+# then `stretch web --replicas 20 --home edge-2` places 16 on edge-2, 4 on edge-1 — from the sheet.
+```
+
+The Mesh sheet has three tabs: `Members` (an append-only heartbeat log — each agent appends only
+its own row, so concurrent writers never clobber each other; readers dedup by newest `last_seen`),
+`Assignments` (the desired workload split, written by the planner, reconciled by each member), and
+`Clusters` (declared clusters, reconciled by a provisioner). Demonstrated end to end: declare
+clusters and a workload in a Google Sheet, and on-prem clusters come up and run their share. Next:
+Sheetwire mesh routing (a service resolves to whichever member hosts it) and mixed Excel+Google
+members in one mesh.
 
 ## A sheet-native runtime (WASM in a cell)
 
