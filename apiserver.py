@@ -45,16 +45,21 @@ TABS = {
 
 # ---------------------------------------------------------------- workbook I/O
 
+import storage   # pluggable backends: .xlsx / .ods / csvdir: / cryptpad:
+
+def _save(wb):
+    storage.save(wb, WORKBOOK)
+
 def _wb():
     import openpyxl
-    if os.path.exists(WORKBOOK):
-        wb = openpyxl.load_workbook(WORKBOOK)
+    wb = storage.load(WORKBOOK)
+    if wb is not None:
         _ensure_schema(wb)
         return wb
     wb = openpyxl.Workbook(); wb.remove(wb.active)
     for tab, headers in TABS.items():
         ws = wb.create_sheet(tab); ws.append(headers)
-    wb.save(WORKBOOK); return wb
+    _save(wb); return wb
 
 def _ensure_schema(wb):
     """Upgrade older workbooks: create missing tabs and append missing trailing
@@ -74,7 +79,7 @@ def _ensure_schema(wb):
                     if ws.cell(row=r, column=1).value not in (None, ""):
                         ws.cell(row=r, column=col, value=defaults.get(h, ""))
                 have.append(h); changed = True
-    if changed: wb.save(WORKBOOK)
+    if changed: _save(wb)
 
 def _dicts(ws):
     rows = list(ws.iter_rows(values_only=True))
@@ -159,19 +164,19 @@ def upsert_deployment(dep):
     for row in ws.iter_rows(min_row=2):
         if row[0].value == name:
             for i, h in enumerate(headers): row[i].value = dep.get(h, row[i].value)
-            wb.save(WORKBOOK); return "updated"
-    ws.append([dep.get(h, "") for h in headers]); wb.save(WORKBOOK); return "created"
+            _save(wb); return "updated"
+    ws.append([dep.get(h, "") for h in headers]); _save(wb); return "created"
 
 def scale(name, replicas):
     wb = _wb(); ws = wb["Deployments"]
     for row in ws.iter_rows(min_row=2):
-        if row[0].value == name: row[2].value = replicas; wb.save(WORKBOOK); return "scaled"
+        if row[0].value == name: row[2].value = replicas; _save(wb); return "scaled"
     return "not found"
 
 def delete(name):
     wb = _wb(); ws = wb["Deployments"]
     for i, row in enumerate(ws.iter_rows(min_row=2), start=2):
-        if row[0].value == name: ws.delete_rows(i, 1); wb.save(WORKBOOK); return "deleted"
+        if row[0].value == name: ws.delete_rows(i, 1); _save(wb); return "deleted"
     return "not found"
 
 def set_schedulable(node, value):
@@ -179,7 +184,7 @@ def set_schedulable(node, value):
     for row in ns.iter_rows(min_row=2):
         if row[0].value == node:
             row[col].value = bool(value)
-            _reschedule(wb); wb.save(WORKBOOK)
+            _reschedule(wb); _save(wb)
             return "uncordoned" if value else "cordoned"
     return "not found"
 
@@ -190,7 +195,7 @@ def drain(node):
     for row in ns.iter_rows(min_row=2):
         if row[0].value == node: row[col].value = False; found = True
     if not found: return "not found"
-    _reschedule(wb, exclude={node}); wb.save(WORKBOOK)
+    _reschedule(wb, exclude={node}); _save(wb)
     return "drained"
 
 def migrate(pod, target):
@@ -204,7 +209,7 @@ def migrate(pod, target):
     ps = wb["Pods"]
     for row in ps.iter_rows(min_row=2):
         if row[0].value == pod:
-            row[2].value = target; wb.save(WORKBOOK); return f"migrating {pod} -> {target}"
+            row[2].value = target; _save(wb); return f"migrating {pod} -> {target}"
     return "pod not found"
 
 def _edit_node_csv(node, column, mutate):
@@ -212,7 +217,7 @@ def _edit_node_csv(node, column, mutate):
     for row in ns.iter_rows(min_row=2):
         if row[0].value == node:
             row[col].value = mutate(str(row[col].value or ""))
-            _reschedule(wb); wb.save(WORKBOOK); return "ok"
+            _reschedule(wb); _save(wb); return "ok"
     return "not found"
 
 def label_node(node, spec):
@@ -377,7 +382,7 @@ def heartbeat(node, ip, cpu_total, mem_total, reported):
     # 3) persist Pods + node status/allocation.
     _write_pods(wb["Pods"], desired, existing, rep)
     _write_node_status(ns, nodes, alloc)
-    wb.save(WORKBOOK)
+    _save(wb)
 
     # 4) this node's marching orders: run what's assigned here, stop the rest.
     out = [{"name": p, "desired": "Running", "image": d["image"], "command": d["command"],

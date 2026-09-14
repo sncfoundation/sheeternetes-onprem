@@ -34,6 +34,29 @@ make pods                             # watch the scheduler place & run them
 ./skctl scale web 4                   # scale; kubelet converges docker to match
 ```
 
+### Storage backends (no vendor lock)
+
+The control plane is a spreadsheet — but not necessarily *Google's*. `storage.py` makes the
+backing store pluggable; the apiserver picks it from `WORKBOOK`, and nothing else changes.
+Vendor neutrality is, after all, the whole point of a foundation.
+
+| `WORKBOOK` | Backend | Needs |
+|---|---|---|
+| `cluster.xlsx` | Excel / OpenPyXL (default) | `openpyxl` |
+| `cluster.ods` | **LibreOffice / OpenDocument** | `pip install odfpy` |
+| `csvdir:/path` or `/path/` | **A directory of CSVs** — one file per tab | stdlib only |
+| `cryptpad:<blob-url>` | **CryptPad** blob (self-hosted, end-to-end) — experimental | `requests` |
+
+```bash
+WORKBOOK=cluster.ods       TOKEN=secret python3 apiserver.py    # a LibreOffice Calc file
+WORKBOOK=csvdir:/data/cl   TOKEN=secret python3 apiserver.py    # plain CSVs — sync the dir
+```
+
+The CSV-directory backend is the serverless answer to "get me off Google": point `WORKBOOK` at a
+folder and let **Syncthing / Nextcloud / Dropbox** replicate it — the sheet stays the source of
+truth, with no server and no cloud vendor. (CryptPad has no server-side per-cell API, so that
+backend stores the whole workbook as one encrypted `.ods` blob; it's marked experimental.)
+
 **Node maintenance** (kubectl-style):
 
 ```bash
