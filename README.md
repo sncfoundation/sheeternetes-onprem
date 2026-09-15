@@ -34,6 +34,29 @@ make pods                             # watch the scheduler place & run them
 ./skctl scale web 4                   # scale; kubelet converges docker to match
 ```
 
+### Storage backends (no vendor lock)
+
+The control plane is a spreadsheet — but not necessarily *Google's*. `storage.py` makes the
+backing store pluggable; the apiserver picks it from `WORKBOOK`, and nothing else changes.
+Vendor neutrality is, after all, the whole point of a foundation.
+
+| `WORKBOOK` | Backend | Needs |
+|---|---|---|
+| `cluster.xlsx` | Excel / OpenPyXL (default) | `openpyxl` |
+| `cluster.ods` | **LibreOffice / OpenDocument** | `pip install odfpy` |
+| `csvdir:/path` or `/path/` | **A directory of CSVs** — one file per tab | stdlib only |
+| `cryptpad:<blob-url>` | **CryptPad** blob (self-hosted, end-to-end) — experimental | `requests` |
+
+```bash
+WORKBOOK=cluster.ods       TOKEN=secret python3 apiserver.py    # a LibreOffice Calc file
+WORKBOOK=csvdir:/data/cl   TOKEN=secret python3 apiserver.py    # plain CSVs — sync the dir
+```
+
+The CSV-directory backend is the serverless answer to "get me off Google": point `WORKBOOK` at a
+folder and let **Syncthing / Nextcloud / Dropbox** replicate it — the sheet stays the source of
+truth, with no server and no cloud vendor. (CryptPad has no server-side per-cell API, so that
+backend stores the whole workbook as one encrypted `.ods` blob; it's marked experimental.)
+
 **Node maintenance** (kubectl-style):
 
 ```bash
@@ -157,6 +180,51 @@ python3 bridge.py stretch web --replicas 10 --cpu 300 \
     --peer  https://script.google.com/macros/s/XXXX/exec --peer-token secret2
 # -> web x10 @ 300m | local free 1000m -> 3, ordered from peer -> 7
 ```
+
+## Sheetmesh — N clusters over a rendezvous sheet
+
+`bridge.py` federates two clusters point-to-point. `sheetmesh.py` generalises that to **many**
+clusters with a shared **Mesh** spreadsheet as the rendezvous. It reuses Sheeternetes' own
+control model — nobody pushes work to anyone else (which would put every cluster's token in a
+shared sheet). Instead each cluster runs an **agent** that publishes its capacity and reconciles
+the assignments addressed to *it*, with its own local token; a **stretch** planner reads the
+whole mesh's free capacity and writes a desired split — no tokens needed to plan.
+
+```bash
+# on each cluster: publish capacity + run its own assignments
+sheetmesh.py agent --mesh <sheet-id> --name A --apiserver http://localhost:8801 --token secret --interval 10
+
+# from anywhere: see the mesh, or spill a deployment across it by capacity
+sheetmesh.py view    --mesh <sheet-id>
+sheetmesh.py stretch web --replicas 20 --cpu 300 --mesh <sheet-id> --home A
+# -> web x20 across 3 live members: A <- 3 (home, full), C <- 17 (most free); each agent applies its share
+```
+
+### Provisioning on-prem clusters *from* the sheet
+
+You can also declare clusters in the Mesh sheet and have them brought up on-prem — a
+spreadsheet-driven Cluster API. Add a row to the `Clusters` tab (`name | provisioner | node_cpu
+| node_mem | port | state`) and a **provisioner** running on that host reconciles it into a real
+local cluster: it seeds an `.xlsx`, starts an `apiserver` for it, marks the row `Running`, and
+registers it into the mesh. It also serves as the mesh agent for the clusters it owns.
+
+```bash
+# on the on-prem host: watch the sheet, bring up the clusters declared for this host
+sheetmesh.py provisioner --mesh <sheet-id> --host mac --base-port 8920 --interval 8
+
+# declaring `edge-1` (2000m) and `edge-2` (5000m) in the Clusters tab brings them up:
+#   edge-1  provisioner=mac  node 2000m -> Running :8920
+#   edge-2  provisioner=mac  node 5000m -> Running :8921
+# then `stretch web --replicas 20 --home edge-2` places 16 on edge-2, 4 on edge-1 — from the sheet.
+```
+
+The Mesh sheet has three tabs: `Members` (an append-only heartbeat log — each agent appends only
+its own row, so concurrent writers never clobber each other; readers dedup by newest `last_seen`),
+`Assignments` (the desired workload split, written by the planner, reconciled by each member), and
+`Clusters` (declared clusters, reconciled by a provisioner). Demonstrated end to end: declare
+clusters and a workload in a Google Sheet, and on-prem clusters come up and run their share. Next:
+Sheetwire mesh routing (a service resolves to whichever member hosts it) and mixed Excel+Google
+members in one mesh.
 
 ## A sheet-native runtime (WASM in a cell)
 
