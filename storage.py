@@ -15,7 +15,7 @@ Every backend round-trips the same `openpyxl.Workbook`, so the apiserver's logic
 unchanged — only the substrate differs. That's the point: the Sheet stays the source of
 truth, but it doesn't have to be Google's.
 """
-import csv, io, os
+import csv, io, os, tempfile
 import openpyxl
 
 def _kind(path):
@@ -34,8 +34,20 @@ def _csvdir_path(path):
 def _load_xlsx(path):
     return openpyxl.load_workbook(path) if os.path.exists(path) else None
 
+def _atomic(path, write):
+    """Write to a temp file next to `path`, then rename over it: a reader (or a crash)
+    never sees a half-written workbook."""
+    d = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=".~sk-", suffix=os.path.splitext(path)[1], dir=d)
+    os.close(fd)
+    try:
+        write(tmp); os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp): os.unlink(tmp)
+        raise
+
 def _save_xlsx(wb, path):
-    wb.save(path)
+    _atomic(path, wb.save)
 
 # ------------------------------------------------------------------ ods (LibreOffice)
 def _load_ods(path):
@@ -75,7 +87,7 @@ def _save_ods(wb, path):
                 tr.addElement(tc)
             table.addElement(tr)
         doc.spreadsheet.addElement(table)
-    doc.save(path)
+    _atomic(path, doc.save)
 
 # ------------------------------------------------------------------ csvdir (synced files)
 def _load_csvdir(path):

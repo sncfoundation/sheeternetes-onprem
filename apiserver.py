@@ -30,7 +30,7 @@ tamper- and replay-resistant. See bridge.py, which signs its cross-substrate pay
 Requires: openpyxl  (pip install openpyxl). The spreadsheet is the store; this process
 is the apiserver. See bridge.py for hybrid federation with Google Sheets.
 """
-import hashlib, hmac, json, os, time
+import hashlib, hmac, json, os, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -616,18 +616,26 @@ def heartbeat(node, ip, cpu_total, mem_total, reported):
 
 # ----------------------------------------------------------------------- HTTP
 
+# Every request is a load-modify-save of one workbook; serialize them so a heartbeat and
+# an apply can't interleave (lost updates) and a read never races a save.
+WB_LOCK = threading.RLock()
+
 class H(BaseHTTPRequestHandler):
     def _json(self, obj, code=200):
         body = json.dumps(obj).encode()
         self.send_response(code); self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
     def do_GET(self):
+        with WB_LOCK: self._get()
+    def do_POST(self):
+        with WB_LOCK: self._post()
+    def _get(self):
         q = parse_qs(urlparse(self.path).query)
         if q.get("token", [""])[0] != TOKEN: return self._json({"error": "unauthorized"}, 401)
         items = read_tab(q.get("kind", ["pods"])[0])
         if items is None: return self._json({"error": "unknown kind"}, 400)
         self._json({"items": items})
-    def do_POST(self):
+    def _post(self):
         n = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(n) or b"{}"
         if SIGNING_KEY and not verify(SIGNING_KEY, self.headers.get("X-SNCF-Timestamp", ""),
