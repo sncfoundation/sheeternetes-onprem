@@ -40,6 +40,19 @@ SK_SECRET_DIR="${SK_SECRET_DIR:-${TMPDIR:-/tmp}/sk-secrets}"; mkdir -p "$SK_SECR
 # name of the docker container backing a pod
 cname() { echo "sk_$1"; }
 
+# SheetGate: install a gateway config inside an nginx pod (stdin = config). Keep the
+# previous file, `nginx -t`, roll back on failure; record the hash only after a reload.
+SG_APPLIED=/etc/nginx/sheetgate.applied
+# shellcheck disable=SC2016  # expanded inside the container, not here
+SG_LOAD='set -e
+conf=/etc/nginx/conf.d/default.conf
+cat > /tmp/sheetgate.conf
+cp "$conf" /tmp/sheetgate.prev 2>/dev/null || : > /tmp/sheetgate.prev
+cp /tmp/sheetgate.conf "$conf"
+if ! nginx -t -q; then cp /tmp/sheetgate.prev "$conf"; exit 1; fi
+nginx -s reload
+echo "$SG_HASH" > "$SG_APPLIED"'
+
 while true; do
   # 1) report the pods we currently run (only ours, by node label), with the host
   #    ports docker actually published and the spec fingerprint they were started from
@@ -153,6 +166,21 @@ while true; do
             ${port_args[@]+"${port_args[@]}"} \
             --cpus "$cpus" --memory "${mem}m" \
             "$image" >/dev/null || echo "[kubelet] FAILED to start $name"
+        fi
+      fi
+      # SheetGate: a gateway pod carries its rendered config; hot-load it when the
+      # hash differs from the last one nginx accepted (validated first, rolled back on error)
+      gw_hash="$(echo "$pod" | jq -r '.gateway_config_hash // ""')"
+      if [ -n "$gw_hash" ] && docker ps -q -f "name=^${cn}$" | grep -q .; then
+        applied="$(docker exec "$cn" cat "$SG_APPLIED" 2>/dev/null || true)"
+        if [ "$applied" != "$gw_hash" ]; then
+          if echo "$pod" | jq -r '.gateway_config' \
+             | docker exec -i -e SG_HASH="$gw_hash" -e SG_APPLIED="$SG_APPLIED" "$cn" sh -c "$SG_LOAD" \
+               >/dev/null 2>"$SK_SECRET_DIR/.sheetgate.err"; then
+            echo "[kubelet] gateway $(echo "$pod" | jq -r '.gateway') config $gw_hash loaded into $name"
+          else   # (on first boot this can just be nginx still starting; retried next tick)
+            echo "[kubelet] gateway config $gw_hash not loaded into $name: $(tail -c 300 "$SK_SECRET_DIR/.sheetgate.err" | tr '\n' ' ')"
+          fi
         fi
       fi
     elif [ "$want" = "Terminating" ]; then

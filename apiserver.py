@@ -5,7 +5,7 @@ spreadsheet (Excel .xlsx). Same verb contract as the Google Apps Script apiserve
 so kubelet.sh / skctl point at it unchanged. Air-gap-friendly: no internet required.
 
   WORKBOOK=cluster.xlsx TOKEN=secret python3 apiserver.py            # serve on :8787
-  GET  /?token=..&kind=pods|nodes|deployments|events|images|layers|secrets   -> {"items":[...]}
+  GET  /?token=..&kind=pods|nodes|deployments|events|images|layers|secrets|gateways|routes
   POST /  {"token":..,"action":"apply|scale|delete|cordon|uncordon|drain|migrate|label|taint", ...}
   POST /  {"token":..,"node":..,"ip":..,"cpu_total":..,"mem_total":..,"pods":[...]}  # kubelet heartbeat
 
@@ -18,6 +18,10 @@ Published ports (the NodePort analog): a Deployment's `ports` cell ('8080:80', o
 an auto-assigned port from NODEPORT_RANGE) is bound by the kubelet with `docker run -p`.
 The scheduler never puts two pods on one node with the same host port, and the Pods tab
 reports what the kubelet actually published as `endpoints` (node_ip:host->container/proto).
+
+SheetGate (Ingress / Gateway API analog, see sheetgate.py): Gateways rows become gateway
+pods (nginx, port published on the node); Routes rows (host/path -> service) are rendered
+into each gateway's config and shipped to its kubelet, which hot-reloads it.
 
 Auth: every request carries a shared token. Additionally, if SIGNING_KEY is set, POSTs
 must be HMAC-SHA256 signed (X-SNCF-Timestamp + X-SNCF-Signature) within SIGN_TTL seconds —
@@ -49,11 +53,17 @@ TABS = {
     "Layers": ["digest", "ordinal", "media_type", "data"],
     # Secrets: base64 data mounted into pods as files (secret_files on a Deployment).
     "Secrets": ["name", "data"],
+    # SheetGate (Ingress / Gateway API analog). A Gateway is an L7 entrypoint published
+    # on a node port; Routes attach host/path rules to it (HTTPRoute-flavored rows).
+    # address/status columns are written back by the control plane.
+    "Gateways": ["name", "listen", "replicas", "node_selector", "image", "address", "status"],
+    "Routes": ["name", "gateway", "host", "path", "service", "port", "rewrite", "status"],
 }
 
 # ---------------------------------------------------------------- workbook I/O
 
 import storage   # pluggable backends: .xlsx / .ods / csvdir: / cryptpad:
+import sheetgate # SheetGate: Gateways/Routes tabs -> gateway pods + nginx config
 
 def _save(wb):
     storage.save(wb, WORKBOOK)
@@ -96,7 +106,8 @@ def _dicts(ws):
     return [dict(zip(headers, r)) for r in rows[1:] if r and r[0] not in (None, "")]
 
 KIND2TAB = {"pods": "Pods", "nodes": "Nodes", "deployments": "Deployments", "events": "Events",
-            "images": "Images", "layers": "Layers", "secrets": "Secrets"}
+            "images": "Images", "layers": "Layers", "secrets": "Secrets",
+            "gateways": "Gateways", "routes": "Routes"}
 
 def read_tab(kind):
     tab = KIND2TAB.get(kind)
@@ -257,6 +268,14 @@ def upsert_deployment(dep):
     except ValueError as e: return f"invalid: {e}"
     return _upsert_row("Deployments", dep)
 
+def upsert_gateway(gw):
+    err = sheetgate.validate_gateway(gw)
+    return f"invalid: {err}" if err else _upsert_row("Gateways", gw)
+
+def upsert_route(route):
+    err = sheetgate.validate_route(route)
+    return f"invalid: {err}" if err else _upsert_row("Routes", route)
+
 def scale(name, replicas):
     wb = _wb(); ws = wb["Deployments"]
     for row in ws.iter_rows(min_row=2):
@@ -264,7 +283,7 @@ def scale(name, replicas):
     return "not found"
 
 def delete(name, kind="deployment"):
-    tab = {"deployment": "Deployments"}.get(kind)
+    tab = {"deployment": "Deployments", "gateway": "Gateways", "route": "Routes"}.get(kind)
     return _delete_row(tab, name) if tab else "unknown kind"
 
 def set_schedulable(node, value):
@@ -440,7 +459,7 @@ def schedule(deployments, nodes, existing, exclude=frozenset(), nodeports=None):
             "image": dep.get("image"), "command": dep.get("command") or "",
             "cpu_req": slot["cpu"], "mem_req": slot["mem"],
             "env": dep.get("env") or "", "secret_files": dep.get("secret_files") or "",
-            "ports": ports,
+            "ports": ports, "gateway": dep.get("gateway") or "",
             "spec_hash": spec_hash(dep.get("image"), dep.get("command"), dep.get("env"),
                                    dep.get("secret_files"), ports)}
     return desired, alloc
@@ -457,14 +476,21 @@ def _load_nodes(ns, now):
                     "taints": parse_taints(r.get("taints"))})
     return out
 
-def _load_deployments(ws):
+def normalize_deployments(rows, gateways=()):
+    """Deployments rows (+ the Deployments synthesized from Gateways rows) with their
+    selector/toleration cells parsed. A gateway owns its `sheetgate-<name>` name."""
+    gw_deps = sheetgate.gateway_deployments(gateways)
+    owned = {d["name"] for d in gw_deps}
     out = []
-    for d in _dicts(ws):
+    for d in [r for r in rows if r.get("name") not in owned] + gw_deps:
         d = dict(d)
         d["node_selector"] = parse_kv(d.get("node_selector"))
         d["tolerations"] = parse_tolerations(d.get("tolerations"))
         out.append(d)
     return out
+
+def _load_deployments(ws):
+    return normalize_deployments(_dicts(ws))
 
 def pod_rows(desired, existing, reported, node_ips, reporter=None):
     """Pure: the Pods tab after a scheduling pass.
@@ -493,12 +519,20 @@ def pod_rows(desired, existing, reported, node_ips, reporter=None):
                      "container_id": cid, "ports": d.get("ports", ""), "endpoints": endpoints})
     return rows
 
-def node_orders(desired, reported, node):
-    """Pure: a kubelet's marching orders — run what's assigned here, stop the rest."""
+def node_orders(desired, reported, node, gateway_configs=None):
+    """Pure: a kubelet's marching orders — run what's assigned here, stop the rest.
+    A gateway pod also carries its rendered config (+hash) for the kubelet to hot-load."""
     keys = ("image", "command", "cpu_req", "mem_req", "deployment", "env", "secret_files",
             "ports", "spec_hash")
-    out = [{"name": p, "desired": "Running", **{k: d.get(k, "") for k in keys}}
-           for p, d in desired.items() if d["node"] == node]
+    out = []
+    for p, d in desired.items():
+        if d["node"] != node: continue
+        order = {"name": p, "desired": "Running", **{k: d.get(k, "") for k in keys}}
+        cfg = (gateway_configs or {}).get(d.get("gateway") or "")
+        if cfg:
+            order["gateway"] = d["gateway"]
+            order["gateway_config"], order["gateway_config_hash"] = cfg
+        out.append(order)
     for pname in reported:
         d = desired.get(pname)
         if not d or d["node"] != node:
@@ -523,20 +557,36 @@ def _write_node_status(ns, nodes, alloc):
         elif not n["schedulable"]:    row[ci["status"]].value = "SchedulingDisabled"
         else:                         row[ci["status"]].value = "Ready"
 
+def _set_columns(ws, tab, values):
+    """In-place write of status columns: values = {row_name: {column: value}}."""
+    cols = {h: i for i, h in enumerate(TABS[tab])}
+    for row in ws.iter_rows(min_row=2):
+        for col, v in (values.get(row[0].value) or {}).items():
+            if row[cols[col]].value != v: row[cols[col]].value = v
+
 def _reconcile(wb, now, reported=None, reporter=None, exclude=frozenset()):
-    """Schedule from the workbook's current state and persist Pods + node status."""
+    """Schedule from the workbook's current state and persist Pods, node status and the
+    SheetGate status columns. Returns (desired, gateway_configs)."""
     ns = wb["Nodes"]
     nodes = _load_nodes(ns, now)
     existing = {p["name"]: p for p in _dicts(wb["Pods"])}
     rep = reported or {}
-    desired, alloc = schedule(_load_deployments(wb["Deployments"]), nodes, existing, exclude)
-    _write_rows(wb["Pods"], "Pods", pod_rows(desired, existing, rep, _node_ips(ns), reporter))
+    user_deps, gateways, routes = _dicts(wb["Deployments"]), _dicts(wb["Gateways"]), _dicts(wb["Routes"])
+    desired, alloc = schedule(normalize_deployments(user_deps, gateways), nodes, existing, exclude)
+    rows = pod_rows(desired, existing, rep, _node_ips(ns), reporter)
+    _write_rows(wb["Pods"], "Pods", rows)
     _write_node_status(ns, nodes, alloc)
-    return desired
+    services = {d["name"] for d in user_deps}
+    configs, route_status = sheetgate.configs(gateways, routes, services)
+    _set_columns(wb["Routes"], "Routes", {n: {"status": st} for n, st in route_status.items()})
+    _set_columns(wb["Gateways"], "Gateways",
+                 {n: {"address": a, "status": st}
+                  for n, (a, st) in sheetgate.gateway_status(gateways, rows).items()})
+    return desired, configs
 
 def _reschedule(wb, exclude=frozenset()):
     """Recompute placement for control actions (cordon/drain); no kubelet report to fold in."""
-    return _reconcile(wb, int(time.time()), exclude=exclude)
+    return _reconcile(wb, int(time.time()), exclude=exclude)[0]
 
 def heartbeat(node, ip, cpu_total, mem_total, reported):
     """Node reports in -> upsert it, run the scheduler over all Deployments, rewrite
@@ -558,11 +608,11 @@ def heartbeat(node, ip, cpu_total, mem_total, reported):
 
     # 2) schedule over the current fleet, 3) persist Pods + node status/allocation.
     rep = {p.get("name"): p for p in (reported or [])}
-    desired = _reconcile(wb, now, rep, reporter=node)
+    desired, configs = _reconcile(wb, now, rep, reporter=node)
     _save(wb)
 
-    # 4) this node's marching orders.
-    return {"pods": node_orders(desired, rep, node)}
+    # 4) this node's marching orders (gateway pods get their rendered config).
+    return {"pods": node_orders(desired, rep, node, configs)}
 
 # ----------------------------------------------------------------------- HTTP
 
@@ -594,7 +644,10 @@ class H(BaseHTTPRequestHandler):
                 _int(body.get("cpu_total"), 1000), _int(body.get("mem_total"), 512),
                 body.get("pods", [])))
         if a == "apply":
-            self._json({"applied": [upsert_deployment(d) for d in body.get("deployments") or []]})
+            res = {"applied": [upsert_deployment(d) for d in body.get("deployments") or []]}
+            if body.get("gateways"): res["gateways"] = [upsert_gateway(g) for g in body["gateways"]]
+            if body.get("routes"):   res["routes"] = [upsert_route(r) for r in body["routes"]]
+            self._json(res)
         elif a == "scale":     self._json({"result": scale(body.get("name"), body.get("replicas"))})
         elif a == "delete":    self._json({"result": delete(body.get("name"), body.get("kind") or "deployment")})
         elif a == "cordon":    self._json({"result": set_schedulable(body.get("name"), False)})

@@ -125,3 +125,43 @@ def test_two_replicas_one_fixed_port_one_node(cluster):
     c.post({"action": "apply", "deployments": [spec]})
     wait_for(lambda: c.pod(f"{svc}-1").get("phase") == "Running")
     assert c.pod(f"{svc}-2")["phase"] == "Unschedulable"   # host port already bound
+
+
+def test_sheetgate_routes_host_and_path_and_hot_reloads(cluster):
+    c = cluster; gw = c.id; listen = BASE + 3
+    hello_svc, web_svc = f"{c.id}-hello", f"{c.id}-web"
+    c.post({"action": "apply",
+            "deployments": [hello(hello_svc, "hello-through-sheetgate"), hello(web_svc, "web-page")],
+            "gateways": [{"name": gw, "listen": listen}],
+            "routes": [
+                {"name": f"{gw}-hello", "gateway": gw, "host": "hello.localhost",
+                 "service": hello_svc, "port": 8080},
+                {"name": f"{gw}-web", "gateway": gw, "path": "/web", "service": web_svc,
+                 "port": 8080, "rewrite": "/"},
+            ]})
+    url = f"http://127.0.0.1:{listen}"
+    # host routing
+    wait_for(lambda: http_get(f"{url}/", host="hello.localhost")[1].strip() == "hello-through-sheetgate")
+    # path routing with prefix rewrite (/web -> /), and the hostname-less route also
+    # applies under the named host
+    assert http_get(f"{url}/web/")[1].strip() == "web-page"
+    assert http_get(f"{url}/web", host="hello.localhost")[1].strip() == "web-page"
+    # no route -> SheetGate's 404
+    status, body = http_get(f"{url}/nothing-here")
+    assert status == 404 and "sheetgate: no route" in body
+    # status written back to the sheet
+    g = wait_for(lambda: next((x for x in c.get("gateways") if x["status"] == "Programmed"), None))
+    assert g["address"] == f"127.0.0.1:{listen}"
+    assert {r["status"] for r in c.get("routes")} == {"Accepted"}
+
+    # edit a cell: point the hello host at the web service -> the gateway hot-reloads
+    cid = c.pod(f"sheetgate-{gw}-1")["container_id"]
+    c.post({"action": "apply", "routes": [{"name": f"{gw}-hello", "service": web_svc}]})
+    wait_for(lambda: http_get(f"{url}/", host="hello.localhost")[1].strip() == "web-page")
+    assert c.pod(f"sheetgate-{gw}-1")["container_id"] == cid     # reloaded, not restarted
+
+    # a route whose service doesn't exist (yet) is a 502, never a failed reload
+    c.post({"action": "apply", "routes": [{"name": f"{gw}-later", "gateway": gw, "path": "/later",
+                                           "service": f"{c.id}-later"}]})
+    wait_for(lambda: http_get(f"{url}/later")[0] == 502)
+    assert http_get(f"{url}/web/")[1].strip() == "web-page"

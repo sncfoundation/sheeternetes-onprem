@@ -9,7 +9,8 @@ Reuses the pure scheduler from apiserver.py; only the storage layer differs.
   CLUSTER_SHEET=<spreadsheet-id> SHEETSOP_CREDS=creds.json TOKEN=secret \
     python3 apiserver_sheets.py                      # serve on :8787
 
-The cluster's structure (Deployments/Nodes/Pods/Events/Images/Layers/Secrets) lives in
+The cluster's structure (Deployments/Nodes/Pods/Events/Images/Layers/Secrets, plus the
+SheetGate Gateways/Routes tabs) lives in
 the tabs of that Google Sheet — open it read-only and watch the cluster reconcile live.
 Requires: google-api-python-client, google-auth. Execution still happens on nodes.
 """
@@ -88,14 +89,15 @@ def _load_nodes(now):
                     "labels": core.parse_kv(r.get("labels")), "taints": core.parse_taints(r.get("taints"))})
     return out
 
-def _load_deployments():
-    out = []
-    for d in records("Deployments"):
-        d = dict(d)
-        d["node_selector"] = core.parse_kv(d.get("node_selector"))
-        d["tolerations"] = core.parse_tolerations(d.get("tolerations"))
-        out.append(d)
-    return out
+def _write_column(tab, col, by_name):
+    """Write one status column in place (never rewrites the user's own cells)."""
+    rows = _rows(tab)
+    if len(rows) < 2: return
+    letter = chr(ord("A") + core.TABS[tab].index(col))
+    vals = [[by_name.get(r[0], r[core.TABS[tab].index(col)] if len(r) > core.TABS[tab].index(col) else "")]
+            if r else [""] for r in rows[1:]]
+    SS.values().update(spreadsheetId=SHEET_ID, range=f"{tab}!{letter}2:{letter}{len(rows)}",
+                       valueInputOption="RAW", body={"values": vals}).execute()
 
 # ------------------------------------------------------------------ heartbeat
 
@@ -120,9 +122,19 @@ def heartbeat(node, ip, cpu_total, mem_total, reported):
                       "labels": core.parse_kv(r.get("labels")), "taints": core.parse_taints(r.get("taints"))})
     existing = {p["name"]: p for p in records("Pods")}
     rep = {p.get("name"): p for p in (reported or [])}
-    desired, alloc = core.schedule(_load_deployments(), nodes, existing)
+    user_deps, gateways, routes = records("Deployments"), records("Gateways"), records("Routes")
+    desired, alloc = core.schedule(core.normalize_deployments(user_deps, gateways), nodes, existing)
     node_ips = {r["name"]: str(r.get("ip") or "") for r in nodes_raw}
-    _write_tab("Pods", core.pod_rows(desired, existing, rep, node_ips, reporter=node))
+    pods = core.pod_rows(desired, existing, rep, node_ips, reporter=node)
+    _write_tab("Pods", pods)
+
+    # SheetGate: render gateway configs, write Routes/Gateways status columns
+    configs, route_status = core.sheetgate.configs(gateways, routes, {d["name"] for d in user_deps})
+    gw_status = core.sheetgate.gateway_status(gateways, pods)
+    if routes: _write_column("Routes", "status", route_status)
+    if gateways:
+        _write_column("Gateways", "address", {n: a for n, (a, _) in gw_status.items()})
+        _write_column("Gateways", "status", {n: st for n, (_, st) in gw_status.items()})
 
     # Node status + cpu_used
     for r in nodes_raw:
@@ -133,7 +145,7 @@ def heartbeat(node, ip, cpu_total, mem_total, reported):
         r["status"] = "NotReady" if not n["fresh"] else ("SchedulingDisabled" if not n["schedulable"] else "Ready")
     _write_tab("Nodes", nodes_raw)
 
-    return {"pods": core.node_orders(desired, rep, node)}
+    return {"pods": core.node_orders(desired, rep, node, configs)}
 
 # ------------------------------------------------------------------ mutations
 
@@ -147,6 +159,18 @@ def apply_deps(deps):
     _write_tab("Deployments", list(by.values()))
     return [d.get("name") for d in deps]
 
+def apply_rows(tab, rows, validate):
+    """Upsert Gateways/Routes rows by name (validated like the .xlsx apiserver)."""
+    by = {d["name"]: d for d in records(tab)}
+    result = []
+    for r in rows:
+        err = validate(r)
+        if err: result.append(f"invalid: {err}"); continue
+        result.append("updated" if r["name"] in by else "created")
+        by[r["name"]] = {**by.get(r["name"], {}), **{k: core._cell(v) for k, v in r.items()}}
+    _write_tab(tab, list(by.values()))
+    return result
+
 def scale(name, replicas):
     cur = records("Deployments")
     for d in cur:
@@ -154,9 +178,12 @@ def scale(name, replicas):
             d["replicas"] = replicas; _write_tab("Deployments", cur); return "scaled"
     return "not found"
 
-def delete(name):
-    cur = [d for d in records("Deployments") if d["name"] != name]
-    _write_tab("Deployments", cur); return "deleted"
+def delete(name, kind="deployment"):
+    tab = {"deployment": "Deployments", "gateway": "Gateways", "route": "Routes"}.get(kind)
+    if not tab: return "unknown kind"
+    cur = records(tab)
+    if not any(d["name"] == name for d in cur): return "not found"
+    _write_tab(tab, [d for d in cur if d["name"] != name]); return "deleted"
 
 # ----------------------------------------------------------------------- HTTP
 
@@ -180,9 +207,15 @@ class H(BaseHTTPRequestHandler):
         if a is None and body.get("node"):
             return self._json(heartbeat(body.get("node"), body.get("ip", ""),
                 core._int(body.get("cpu_total"), 1000), core._int(body.get("mem_total"), 512), body.get("pods", [])))
-        if a == "apply":     self._json({"applied": apply_deps(body.get("deployments") or [])})
+        if a == "apply":
+            res = {"applied": apply_deps(body.get("deployments") or [])}
+            if body.get("gateways"):
+                res["gateways"] = apply_rows("Gateways", body["gateways"], core.sheetgate.validate_gateway)
+            if body.get("routes"):
+                res["routes"] = apply_rows("Routes", body["routes"], core.sheetgate.validate_route)
+            self._json(res)
         elif a == "scale":   self._json({"result": scale(body.get("name"), body.get("replicas"))})
-        elif a == "delete":  self._json({"result": delete(body.get("name"))})
+        elif a == "delete":  self._json({"result": delete(body.get("name"), body.get("kind") or "deployment")})
         else: self._json({"error": "unknown action"}, 400)
     def log_message(self, *a): pass
 

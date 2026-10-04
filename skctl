@@ -8,10 +8,11 @@
 #   TOKEN=CHANGE_ME_super_secret
 #
 # Usage:
-#   skctl get pods|nodes|deployments|events
-#   skctl apply lab/hello-web.json
+#   skctl get pods|nodes|deployments|events|gateways|routes
+#   skctl apply lab/hello-web.json       # deployments, gateways and routes in one file
 #   skctl scale <deployment> <replicas>
 #   skctl delete <deployment>
+#   skctl delete gateway|route <name>    # SheetGate objects
 #   skctl cordon|uncordon|drain <node>   # node maintenance (drain evicts pods)
 #   skctl migrate <pod> <node>           # move a pod to a target node
 #   skctl label <node> disk=ssd          # set/remove (disk-) a node label
@@ -36,6 +37,8 @@ case "$cmd" in
       pods)        api_get pods | jq -r '["NAME","DEPLOYMENT","NODE","PHASE","CONTAINER","ENDPOINTS"], (.items[]|[.name,.deployment,.node,.phase,(.container_id|tostring|.[0:12]),((.endpoints // "") | if . == "" then "-" else . end)]) | @tsv' | column -t -s $'\t' ;;
       nodes)       api_get nodes | jq -r '["NAME","IP","CPU","CPU_USED","MEM","STATUS","HEARTBEAT"], (.items[]|[.name,.ip,.cpu_total,.cpu_used,.mem_total,.status,.last_heartbeat]) | @tsv' | column -t -s $'\t' ;;
       deployments|deploy) api_get deployments | jq -r '["NAME","IMAGE","REPLICAS","CPU","MEM","PORTS"], (.items[]|[.name,.image,.replicas,.cpu_req,.mem_req,((.ports // "") | tostring | if . == "" then "-" else . end)]) | @tsv' | column -t -s $'\t' ;;
+      gateways|gateway|gw) api_get gateways | jq -r '["NAME","LISTEN","REPLICAS","ADDRESS","STATUS"], (.items[]|[.name,((.listen // "") | tostring | if . == "" then "auto" else . end),((.replicas // "") | tostring | if . == "" then "1" else . end),((.address // "") | if . == "" then "-" else . end),(.status // "")]) | @tsv' | column -t -s $'\t' ;;
+      routes|route) api_get routes | jq -r '["NAME","GATEWAY","HOST","PATH","SERVICE","PORT","REWRITE","STATUS"], (.items[]|[.name,((.gateway // "") | if . == "" then "*" else . end),((.host // "") | if . == "" then "*" else . end),((.path // "") | if . == "" then "/" else . end),.service,((.port // "") | tostring | if . == "" then "80" else . end),((.rewrite // "") | if . == "" then "-" else . end),(.status // "")]) | @tsv' | column -t -s $'\t' ;;
       events)      api_get events | jq -r '.items[-25:][] | [.ts,.kind,.object,.message] | @tsv' | column -t -s $'\t' ;;
       *) echo "unknown kind: $kind" >&2; exit 1 ;;
     esac
@@ -43,15 +46,18 @@ case "$cmd" in
   apply)
     file="${1:?usage: skctl apply <file.json>}"
     spec="$(cat "$file")"
-    api_post "$(jq -n --arg t "$TOKEN" --argjson d "$spec" '{token:$t, action:"apply", deployments:($d.deployments)}')" | jq .
+    api_post "$(jq -n --arg t "$TOKEN" --argjson d "$spec" \
+      '{token:$t, action:"apply", deployments:($d.deployments // []), gateways:($d.gateways // []), routes:($d.routes // [])}')" | jq .
     ;;
   scale)
     name="${1:?deployment}"; replicas="${2:?replicas}"
     api_post "$(jq -n --arg t "$TOKEN" --arg n "$name" --argjson r "$replicas" '{token:$t, action:"scale", name:$n, replicas:$r}')" | jq .
     ;;
   delete)
-    name="${1:?deployment}"
-    api_post "$(jq -n --arg t "$TOKEN" --arg n "$name" '{token:$t, action:"delete", name:$n}')" | jq .
+    kind="deployment"
+    case "${1:-}" in gateway|route|deployment) kind="$1"; shift ;; esac
+    name="${1:?usage: skctl delete [gateway|route] <name>}"
+    api_post "$(jq -n --arg t "$TOKEN" --arg k "$kind" --arg n "$name" '{token:$t, action:"delete", kind:$k, name:$n}')" | jq .
     ;;
   cordon|uncordon|drain)
     name="${1:?node}"
