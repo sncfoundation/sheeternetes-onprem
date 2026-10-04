@@ -3,7 +3,7 @@
 WORKBOOK ?= cluster.xlsx
 PORT     ?= 8787
 
-.PHONY: help up node apply pods nodes events tour test down clean
+.PHONY: help up node apply pods nodes events tour test e2e down clean
 help:            ## show targets
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | sed 's/:.*##/\t—/' | sort
 
@@ -24,6 +24,9 @@ tour:            ## guided demo
 
 test:            ## run the unit + integration suite
 	python3 -m pytest -q
+
+e2e:             ## live end-to-end over real Docker (apiserver + kubelet.sh; pulls images)
+	SK_E2E=1 python3 -m pytest -q tests/test_e2e_docker.py
 
 down:            ## stop demo workloads (scale everything created by the lab to 0)
 	-./skctl scale web 0

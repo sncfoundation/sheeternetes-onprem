@@ -26,8 +26,7 @@ SHEET_ID = os.environ["CLUSTER_SHEET"]
 TOKEN = os.environ.get("TOKEN", "CHANGE_ME_super_secret")
 PORT = int(os.environ.get("PORT", "8787"))
 NODE_TTL = int(os.environ.get("NODE_TTL", "30"))
-KIND2TAB = {"pods": "Pods", "nodes": "Nodes", "deployments": "Deployments", "events": "Events",
-            "images": "Images", "layers": "Layers", "secrets": "Secrets"}
+KIND2TAB = core.KIND2TAB
 
 def _svc():
     info = json.load(open(os.environ.get("SHEETSOP_CREDS", os.path.expanduser("~/.sheetsop/creds.json"))))
@@ -122,15 +121,8 @@ def heartbeat(node, ip, cpu_total, mem_total, reported):
     existing = {p["name"]: p for p in records("Pods")}
     rep = {p.get("name"): p for p in (reported or [])}
     desired, alloc = core.schedule(_load_deployments(), nodes, existing)
-
-    # Pods tab
-    pods = []
-    for pname, d in desired.items():
-        live = rep.get(pname) or {}
-        phase = "Unschedulable" if not d["node"] else (live.get("phase") or ("Running" if pname in rep else "Pending"))
-        cid = live.get("container_id") or (existing.get(pname) or {}).get("container_id") or ""
-        pods.append({"name": pname, "deployment": d["deployment"], "node": d["node"], "phase": phase, "container_id": cid})
-    _write_tab("Pods", pods)
+    node_ips = {r["name"]: str(r.get("ip") or "") for r in nodes_raw}
+    _write_tab("Pods", core.pod_rows(desired, existing, rep, node_ips, reporter=node))
 
     # Node status + cpu_used
     for r in nodes_raw:
@@ -141,15 +133,7 @@ def heartbeat(node, ip, cpu_total, mem_total, reported):
         r["status"] = "NotReady" if not n["fresh"] else ("SchedulingDisabled" if not n["schedulable"] else "Ready")
     _write_tab("Nodes", nodes_raw)
 
-    out = [{"name": p, "desired": "Running", "image": d["image"], "command": d["command"],
-            "cpu_req": d["cpu_req"], "mem_req": d["mem_req"], "deployment": d["deployment"],
-            "env": d.get("env", ""), "secret_files": d.get("secret_files", "")}
-           for p, d in desired.items() if d["node"] == node]
-    for pname in rep:
-        d = desired.get(pname)
-        if not d or d["node"] != node:
-            out.append({"name": pname, "desired": "Terminating"})
-    return {"pods": out}
+    return {"pods": core.node_orders(desired, rep, node)}
 
 # ------------------------------------------------------------------ mutations
 
@@ -157,7 +141,9 @@ def apply_deps(deps):
     cur = records("Deployments")
     by = {d["name"]: d for d in cur}
     for d in deps:
-        by[d["name"]] = {**by.get(d["name"], {}), **d}
+        try: core.parse_ports(d.get("ports"))
+        except ValueError as e: return [f"invalid {d.get('name')}: {e}"]
+        by[d["name"]] = {**by.get(d["name"], {}), **{k: core._cell(v) for k, v in d.items()}}
     _write_tab("Deployments", list(by.values()))
     return [d.get("name") for d in deps]
 
@@ -194,7 +180,7 @@ class H(BaseHTTPRequestHandler):
         if a is None and body.get("node"):
             return self._json(heartbeat(body.get("node"), body.get("ip", ""),
                 core._int(body.get("cpu_total"), 1000), core._int(body.get("mem_total"), 512), body.get("pods", [])))
-        if a == "apply":     self._json({"applied": apply_deps(body.get("deployments", []))})
+        if a == "apply":     self._json({"applied": apply_deps(body.get("deployments") or [])})
         elif a == "scale":   self._json({"result": scale(body.get("name"), body.get("replicas"))})
         elif a == "delete":  self._json({"result": delete(body.get("name"))})
         else: self._json({"error": "unknown action"}, 400)

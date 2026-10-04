@@ -14,6 +14,11 @@ Ready, schedulable nodes by cpu_req/mem_req (a pod that fits nowhere is Unschedu
 keeps pods sticky to their node, ages out silent nodes (failover), and honors
 cordon/drain. The scheduler core is the pure function `schedule()` below.
 
+Published ports (the NodePort analog): a Deployment's `ports` cell ('8080:80', or '80' for
+an auto-assigned port from NODEPORT_RANGE) is bound by the kubelet with `docker run -p`.
+The scheduler never puts two pods on one node with the same host port, and the Pods tab
+reports what the kubelet actually published as `endpoints` (node_ip:host->container/proto).
+
 Auth: every request carries a shared token. Additionally, if SIGNING_KEY is set, POSTs
 must be HMAC-SHA256 signed (X-SNCF-Timestamp + X-SNCF-Signature) within SIGN_TTL seconds —
 tamper- and replay-resistant. See bridge.py, which signs its cross-substrate payloads.
@@ -31,10 +36,13 @@ PORT = int(os.environ.get("PORT", "8787"))
 NODE_TTL = int(os.environ.get("NODE_TTL", "30"))   # seconds before a silent node is NotReady
 SIGNING_KEY = os.environ.get("SIGNING_KEY", "")    # if set, POSTs must carry a valid HMAC
 SIGN_TTL = int(os.environ.get("SIGN_TTL", "300"))  # max clock skew (s) for a signed request
+NODEPORT_RANGE = os.environ.get("NODEPORT_RANGE", "30000-32767")  # auto-assigned host ports
 TABS = {
-    "Deployments": ["name", "image", "replicas", "cpu_req", "mem_req", "command", "node_selector", "tolerations", "env", "secret_files"],
+    "Deployments": ["name", "image", "replicas", "cpu_req", "mem_req", "command", "node_selector", "tolerations", "env", "secret_files", "ports"],
     "Nodes": ["name", "ip", "cpu_total", "cpu_used", "mem_total", "status", "last_heartbeat", "schedulable", "labels", "taints"],
-    "Pods": ["name", "deployment", "node", "phase", "container_id"],
+    # ports = published mapping assigned by the scheduler (host:container/proto);
+    # endpoints = what the kubelet actually bound, as node_ip:host->container/proto.
+    "Pods": ["name", "deployment", "node", "phase", "container_id", "ports", "endpoints"],
     "Events": ["ts", "kind", "object", "message"],
     # SICF native image store (see sci: SICF v0.1). Populated by `sheetbuild import`.
     "Images": ["name", "digest", "config", "layers", "created", "size"],
@@ -87,9 +95,11 @@ def _dicts(ws):
     headers = [str(h) for h in rows[0]]
     return [dict(zip(headers, r)) for r in rows[1:] if r and r[0] not in (None, "")]
 
+KIND2TAB = {"pods": "Pods", "nodes": "Nodes", "deployments": "Deployments", "events": "Events",
+            "images": "Images", "layers": "Layers", "secrets": "Secrets"}
+
 def read_tab(kind):
-    tab = {"pods": "Pods", "nodes": "Nodes", "deployments": "Deployments", "events": "Events",
-           "images": "Images", "layers": "Layers", "secrets": "Secrets"}.get(kind)
+    tab = KIND2TAB.get(kind)
     if not tab: return None
     return _dicts(_wb()[tab])
 
@@ -141,6 +151,69 @@ def parse_tolerations(s):
     """'gpu=true,zone' -> {'gpu=true','zone'}  (matches a taint by 'k=v' or bare 'k')."""
     return {p.strip() for p in str(s or "").split(",") if p.strip()}
 
+def parse_ports(s):
+    """Published ports of a Deployment (the NodePort analog), docker -p flavored:
+
+      '80'           container port 80, host port auto-assigned from NODEPORT_RANGE
+      '8080:80'      host port 8080 -> container port 80
+      '8080:80/udp'  same, UDP (default proto: tcp)
+
+    Accepts a comma-separated string or a JSON list. Returns
+    [(host_port or None, container_port, proto)]. Raises ValueError on garbage, so
+    `apply` can reject a bad cell instead of the kubelet failing silently later."""
+    if isinstance(s, (list, tuple)):
+        parts = [str(p) for p in s]
+    else:
+        parts = str(s or "").split(",")
+    out = []
+    for part in parts:
+        part = part.strip()
+        if not part: continue
+        spec, _, proto = part.partition("/")
+        proto = (proto or "tcp").strip().lower()
+        if proto not in ("tcp", "udp"):
+            raise ValueError(f"bad protocol in port {part!r}")
+        host, sep, cont = spec.rpartition(":")
+        try:
+            c = int(cont); h = int(host) if sep else None
+        except ValueError:
+            raise ValueError(f"bad port {part!r} (want 'container', 'host:container' or '…/udp')")
+        if not 1 <= c <= 65535 or (h is not None and not 1 <= h <= 65535):
+            raise ValueError(f"port out of range in {part!r}")
+        out.append((h, c, proto))
+    return out
+
+def _ports_lenient(s):
+    """parse_ports for the reconcile path: a cell hand-edited into nonsense is
+    treated as 'no ports' rather than taking the scheduler down."""
+    try: return parse_ports(s)
+    except ValueError: return []
+
+def format_ports(mapping):
+    """[(host, container, proto)] -> '30000:80/tcp,8080:80/tcp' (the Pods.ports cell)."""
+    return ",".join(f"{h}:{c}/{p}" for h, c, p in mapping)
+
+def port_range(spec=None):
+    lo, _, hi = str(spec or NODEPORT_RANGE).partition("-")
+    lo = _int(lo, 30000); hi = _int(hi, lo)
+    return (lo, hi) if lo <= hi else (hi, lo)
+
+def parse_docker_ports(s):
+    """`docker ps --format {{.Ports}}` -> {(host, container, proto)} actually published.
+    e.g. '0.0.0.0:30000->80/tcp, [::]:30000->80/tcp' -> {(30000, 80, 'tcp')}.
+    Exposed-but-unpublished entries ('80/tcp') are ignored."""
+    out = set()
+    for part in str(s or "").split(","):
+        part = part.strip()
+        if "->" not in part: continue
+        left, right = part.split("->", 1)
+        host = left.rpartition(":")[2]
+        cont, _, proto = right.partition("/")
+        if "-" in host or "-" in cont: continue   # ranges are never produced by the kubelet
+        try: out.add((int(host), int(cont), (proto or "tcp").lower()))
+        except ValueError: continue
+    return out
+
 def _tolerates(tols, taints):
     for k, v, eff in taints:
         if eff == "NoSchedule" and f"{k}={v}" not in tols and k not in tols:
@@ -158,14 +231,31 @@ def _matches(node, dep):
 
 # ------------------------------------------------------------- CRUD (skctl verbs)
 
-def upsert_deployment(dep):
-    wb = _wb(); ws = wb["Deployments"]; headers = TABS["Deployments"]
-    name = dep.get("name")
+def _cell(v):
+    """JSON manifests may carry lists (e.g. "ports": ["8080:80", "53/udp"]); a cell holds a string."""
+    return ",".join(str(x) for x in v) if isinstance(v, (list, tuple)) else v
+
+def _upsert_row(tab, obj):
+    wb = _wb(); ws = wb[tab]; headers = TABS[tab]
+    name = obj.get("name")
     for row in ws.iter_rows(min_row=2):
         if row[0].value == name:
-            for i, h in enumerate(headers): row[i].value = dep.get(h, row[i].value)
+            for i, h in enumerate(headers):
+                if h in obj: row[i].value = _cell(obj[h])
             _save(wb); return "updated"
-    ws.append([dep.get(h, "") for h in headers]); _save(wb); return "created"
+    ws.append([_cell(obj.get(h, "")) for h in headers]); _save(wb); return "created"
+
+def _delete_row(tab, name):
+    wb = _wb(); ws = wb[tab]
+    for i, row in enumerate(ws.iter_rows(min_row=2), start=2):
+        if row[0].value == name: ws.delete_rows(i, 1); _save(wb); return "deleted"
+    return "not found"
+
+def upsert_deployment(dep):
+    if not dep.get("name"): return "invalid: name is required"
+    try: parse_ports(dep.get("ports"))
+    except ValueError as e: return f"invalid: {e}"
+    return _upsert_row("Deployments", dep)
 
 def scale(name, replicas):
     wb = _wb(); ws = wb["Deployments"]
@@ -173,11 +263,9 @@ def scale(name, replicas):
         if row[0].value == name: row[2].value = replicas; _save(wb); return "scaled"
     return "not found"
 
-def delete(name):
-    wb = _wb(); ws = wb["Deployments"]
-    for i, row in enumerate(ws.iter_rows(min_row=2), start=2):
-        if row[0].value == name: ws.delete_rows(i, 1); _save(wb); return "deleted"
-    return "not found"
+def delete(name, kind="deployment"):
+    tab = {"deployment": "Deployments"}.get(kind)
+    return _delete_row(tab, name) if tab else "unknown kind"
 
 def set_schedulable(node, value):
     wb = _wb(); ns = wb["Nodes"]; col = TABS["Nodes"].index("schedulable")
@@ -246,59 +334,115 @@ def taint_node(node, spec):
 
 # ------------------------------------------------------------------ scheduler
 
-def schedule(deployments, nodes, existing, exclude=frozenset()):
+def spec_hash(image, command, env, secret_files, ports):
+    """Fingerprint of everything that requires a container *restart* when it changes.
+    The kubelet labels containers with it and recreates on mismatch (e.g. a new port)."""
+    blob = json.dumps([image or "", command or "", env or "", secret_files or "", ports or ""])
+    return hashlib.sha256(blob.encode()).hexdigest()[:12]
+
+def schedule(deployments, nodes, existing, exclude=frozenset(), nodeports=None):
     """Pure scheduler — no I/O, fully unit-testable.
 
-    deployments: [{name,image,replicas,cpu_req,mem_req,command,node_selector,tolerations}]
+    deployments: [{name,image,replicas,cpu_req,mem_req,command,node_selector,tolerations,ports}]
     nodes:       [{name,cpu_total,mem_total,fresh(bool),schedulable(bool),labels,taints}]
-    existing:    {podname: {"node": ...}}   (for sticky placement)
+    existing:    {podname: {"node": ..., "ports": "30000:80/tcp"}}  (sticky placement + ports)
     exclude:     node names to evict from (drain) — their pods are re-placed.
+    nodeports:   'lo-hi' range for auto-assigned host ports (default: NODEPORT_RANGE).
 
     Affinity: a pod is only placed on a node whose labels are a superset of the
     deployment's node_selector and whose NoSchedule taints the pod tolerates.
 
+    Host ports: a published host port can be bound once per node and protocol, so two
+    replicas asking for the same fixed port never share a node (the second one spreads,
+    or is Unschedulable). Auto ports ('80') get the lowest free port of the range on the
+    chosen node, never one that any Deployment requests as a fixed port, and keep their
+    previous port across reschedules on the same node.
+
     Returns (desired, alloc):
-      desired = {podname: {deployment,node,image,command,cpu_req,mem_req}}
-                node == "" means Unschedulable (fits nowhere / no capacity).
+      desired = {podname: {deployment,node,image,command,cpu_req,mem_req,env,secret_files,
+                           ports,spec_hash}}
+                node == "" means Unschedulable (fits nowhere / no capacity / port taken).
       alloc   = {nodename: {"cpu": millicores, "mem": MiB}}  placed load per node.
-    Placement is resource-aware best-effort spread: a pod stays on its current node
-    if that node is fresh, not excluded, and still has room; otherwise it lands on the
-    fresh+schedulable node with the most free CPU that can fit it.
+    Placement is two-phase so running pods win over newcomers: first every pod that can
+    stay on its current node (fresh, not excluded, still matches, still fits) is kept;
+    then the rest land on the fresh+schedulable node with the most free CPU that fits.
     """
     keepable = {n["name"] for n in nodes if n["fresh"]} - set(exclude)
     by_name = {n["name"]: n for n in nodes}
     schedulable_fresh = [n for n in nodes if n["fresh"] and n["schedulable"] and n["name"] not in exclude]
     cap = {n["name"]: (n["cpu_total"], n["mem_total"]) for n in nodes}
     alloc = {n["name"]: {"cpu": 0, "mem": 0} for n in nodes}
+    bound = {n["name"]: set() for n in nodes}           # (host_port, proto) in use per node
+    lo, hi = port_range(nodeports)
+    fixed_anywhere = {(h, p) for d in deployments for h, _, p in _ports_lenient(d.get("ports")) if h}
 
     def fits(name, cpu, mem):
         ct, mt = cap.get(name, (0, 0))
         return alloc[name]["cpu"] + cpu <= ct and alloc[name]["mem"] + mem <= mt
 
-    def place(name, cpu, mem):
-        alloc[name]["cpu"] += cpu; alloc[name]["mem"] += mem
+    def bind_ports(name, specs, prev_ports):
+        """Host-port assignment for one pod on node `name`, or None if impossible."""
+        taken = set(bound[name]); mapping = []
+        prev = {(c, p): h for h, c, p in prev_ports}
+        for h, c, p in specs:
+            if h is None:
+                h = prev.get((c, p))
+                if h is None or not lo <= h <= hi or (h, p) in taken or (h, p) in fixed_anywhere:
+                    h = next((x for x in range(lo, hi + 1)
+                              if (x, p) not in taken and (x, p) not in fixed_anywhere), None)
+                    if h is None: return None                 # range exhausted on this node
+            elif (h, p) in taken:
+                return None                                   # fixed host port already bound
+            taken.add((h, p)); mapping.append((h, c, p))
+        return mapping
 
-    desired = {}
+    # one slot per replica, in Deployment-row order
+    slots = []
     for dep in deployments:
         name = dep.get("name")
         if not name: continue
         cpu_req = _int(dep.get("cpu_req"), 100); mem_req = _int(dep.get("mem_req"), 64)
+        specs = _ports_lenient(dep.get("ports"))
         placeable = [n["name"] for n in schedulable_fresh if _matches(n, dep)]   # affinity + taints
         for i in range(1, _int(dep.get("replicas"), 0) + 1):
             pname = f"{name}-{i}"
-            prev = (existing.get(pname) or {}).get("node")
-            chosen = ""
-            if prev in keepable and _matches(by_name[prev], dep) and fits(prev, cpu_req, mem_req):
-                chosen = prev
-            else:
-                candidates = [nm for nm in placeable if fits(nm, cpu_req, mem_req)]
-                if candidates:
-                    chosen = max(candidates, key=lambda nm: cap[nm][0] - alloc[nm]["cpu"])
-            if chosen: place(chosen, cpu_req, mem_req)
-            desired[pname] = {"deployment": name, "node": chosen,
-                              "image": dep.get("image"), "command": dep.get("command") or "",
-                              "cpu_req": cpu_req, "mem_req": mem_req,
-                              "env": dep.get("env") or "", "secret_files": dep.get("secret_files") or ""}
+            ex = existing.get(pname) or {}
+            slots.append({"pod": pname, "dep": dep, "cpu": cpu_req, "mem": mem_req, "specs": specs,
+                          "placeable": placeable, "prev": ex.get("node"),
+                          "prev_ports": _ports_lenient(ex.get("ports")), "node": "", "ports": []})
+
+    def take(slot, node, mapping):
+        alloc[node]["cpu"] += slot["cpu"]; alloc[node]["mem"] += slot["mem"]
+        bound[node].update((h, p) for h, _, p in mapping)
+        slot["node"], slot["ports"] = node, mapping
+
+    for slot in slots:                                       # phase 1: sticky
+        prev = slot["prev"]
+        if prev in keepable and _matches(by_name[prev], slot["dep"]) and fits(prev, slot["cpu"], slot["mem"]):
+            mapping = bind_ports(prev, slot["specs"], slot["prev_ports"])
+            if mapping is not None: take(slot, prev, mapping)
+    for slot in slots:                                       # phase 2: place the rest
+        if slot["node"]: continue
+        best = None
+        for nm in slot["placeable"]:
+            if not fits(nm, slot["cpu"], slot["mem"]): continue
+            mapping = bind_ports(nm, slot["specs"], [])
+            if mapping is None: continue
+            free = cap[nm][0] - alloc[nm]["cpu"]
+            if best is None or free > best[0]: best = (free, nm, mapping)
+        if best: take(slot, best[1], best[2])
+
+    desired = {}
+    for slot in slots:
+        dep = slot["dep"]; ports = format_ports(slot["ports"])
+        desired[slot["pod"]] = {
+            "deployment": dep["name"], "node": slot["node"],
+            "image": dep.get("image"), "command": dep.get("command") or "",
+            "cpu_req": slot["cpu"], "mem_req": slot["mem"],
+            "env": dep.get("env") or "", "secret_files": dep.get("secret_files") or "",
+            "ports": ports,
+            "spec_hash": spec_hash(dep.get("image"), dep.get("command"), dep.get("env"),
+                                   dep.get("secret_files"), ports)}
     return desired, alloc
 
 def _load_nodes(ns, now):
@@ -322,16 +466,51 @@ def _load_deployments(ws):
         out.append(d)
     return out
 
-def _write_pods(ps, desired, existing, rep):
-    if ps.max_row > 1: ps.delete_rows(2, ps.max_row - 1)
+def pod_rows(desired, existing, reported, node_ips, reporter=None):
+    """Pure: the Pods tab after a scheduling pass.
+
+    reported: {podname: {phase, container_id, ports}} from the reporting kubelet.
+    reporter: that kubelet's node (None for control actions like cordon/drain).
+    A pod that stays on *another* node keeps its last known phase/endpoints — only its
+    own kubelet may vouch for it, so multi-node clusters don't flap Running<->Pending."""
+    rows = []
     for pname, d in desired.items():
-        live = rep.get(pname) or {}
+        live = reported.get(pname)
+        ex = existing.get(pname) or {}
+        same_node = bool(d["node"]) and ex.get("node") == d["node"]
         if not d["node"]:
-            phase = "Unschedulable"
+            phase, endpoints = "Unschedulable", ""
+        elif live is not None:
+            phase = live.get("phase") or "Running"
+            ip = node_ips.get(d["node"]) or ""
+            endpoints = ",".join(f"{ip}:{h}->{c}/{p}" for h, c, p in sorted(parse_docker_ports(live.get("ports"))))
+        elif same_node and d["node"] != reporter:
+            phase, endpoints = ex.get("phase") or "Pending", ex.get("endpoints") or ""
         else:
-            phase = live.get("phase") or ("Running" if pname in rep else "Pending")
-        cid = live.get("container_id") or (existing.get(pname) or {}).get("container_id") or ""
-        ps.append([pname, d["deployment"], d["node"], phase, cid])
+            phase, endpoints = "Pending", ""
+        cid = (live or {}).get("container_id") or (ex.get("container_id") if same_node else "") or ""
+        rows.append({"name": pname, "deployment": d["deployment"], "node": d["node"], "phase": phase,
+                     "container_id": cid, "ports": d.get("ports", ""), "endpoints": endpoints})
+    return rows
+
+def node_orders(desired, reported, node):
+    """Pure: a kubelet's marching orders — run what's assigned here, stop the rest."""
+    keys = ("image", "command", "cpu_req", "mem_req", "deployment", "env", "secret_files",
+            "ports", "spec_hash")
+    out = [{"name": p, "desired": "Running", **{k: d.get(k, "") for k in keys}}
+           for p, d in desired.items() if d["node"] == node]
+    for pname in reported:
+        d = desired.get(pname)
+        if not d or d["node"] != node:
+            out.append({"name": pname, "desired": "Terminating"})
+    return out
+
+def _write_rows(ws, tab, rows):
+    if ws.max_row > 1: ws.delete_rows(2, ws.max_row - 1)
+    for r in rows: ws.append([r.get(h, "") for h in TABS[tab]])
+
+def _node_ips(ns):
+    return {r["name"]: str(r.get("ip") or "") for r in _dicts(ns)}
 
 def _write_node_status(ns, nodes, alloc):
     ci = {h: TABS["Nodes"].index(h) for h in ("cpu_used", "status", "schedulable")}
@@ -344,16 +523,20 @@ def _write_node_status(ns, nodes, alloc):
         elif not n["schedulable"]:    row[ci["status"]].value = "SchedulingDisabled"
         else:                         row[ci["status"]].value = "Ready"
 
-def _reschedule(wb, exclude=frozenset()):
-    """Recompute placement from current state and persist Pods + node status.
-    Used by control actions (cordon/drain); no live kubelet report to fold in."""
-    now = int(time.time()); ns = wb["Nodes"]
+def _reconcile(wb, now, reported=None, reporter=None, exclude=frozenset()):
+    """Schedule from the workbook's current state and persist Pods + node status."""
+    ns = wb["Nodes"]
     nodes = _load_nodes(ns, now)
     existing = {p["name"]: p for p in _dicts(wb["Pods"])}
+    rep = reported or {}
     desired, alloc = schedule(_load_deployments(wb["Deployments"]), nodes, existing, exclude)
-    _write_pods(wb["Pods"], desired, existing, rep={})
+    _write_rows(wb["Pods"], "Pods", pod_rows(desired, existing, rep, _node_ips(ns), reporter))
     _write_node_status(ns, nodes, alloc)
     return desired
+
+def _reschedule(wb, exclude=frozenset()):
+    """Recompute placement for control actions (cordon/drain); no kubelet report to fold in."""
+    return _reconcile(wb, int(time.time()), exclude=exclude)
 
 def heartbeat(node, ip, cpu_total, mem_total, reported):
     """Node reports in -> upsert it, run the scheduler over all Deployments, rewrite
@@ -373,27 +556,13 @@ def heartbeat(node, ip, cpu_total, mem_total, reported):
     if not found:
         ns.append([node, ip, cpu_total, 0, mem_total, "Ready", now, True])
 
-    # 2) schedule over the current fleet.
-    nodes = _load_nodes(ns, now)
-    existing = {p["name"]: p for p in _dicts(wb["Pods"])}
+    # 2) schedule over the current fleet, 3) persist Pods + node status/allocation.
     rep = {p.get("name"): p for p in (reported or [])}
-    desired, alloc = schedule(_load_deployments(wb["Deployments"]), nodes, existing)
-
-    # 3) persist Pods + node status/allocation.
-    _write_pods(wb["Pods"], desired, existing, rep)
-    _write_node_status(ns, nodes, alloc)
+    desired = _reconcile(wb, now, rep, reporter=node)
     _save(wb)
 
-    # 4) this node's marching orders: run what's assigned here, stop the rest.
-    out = [{"name": p, "desired": "Running", "image": d["image"], "command": d["command"],
-            "cpu_req": d["cpu_req"], "mem_req": d["mem_req"], "deployment": d["deployment"],
-            "env": d.get("env", ""), "secret_files": d.get("secret_files", "")}
-           for p, d in desired.items() if d["node"] == node]
-    for pname in rep:
-        d = desired.get(pname)
-        if not d or d["node"] != node:
-            out.append({"name": pname, "desired": "Terminating"})
-    return {"pods": out}
+    # 4) this node's marching orders.
+    return {"pods": node_orders(desired, rep, node)}
 
 # ----------------------------------------------------------------------- HTTP
 
@@ -425,9 +594,9 @@ class H(BaseHTTPRequestHandler):
                 _int(body.get("cpu_total"), 1000), _int(body.get("mem_total"), 512),
                 body.get("pods", [])))
         if a == "apply":
-            self._json({"applied": [upsert_deployment(d) for d in body.get("deployments", [])]})
+            self._json({"applied": [upsert_deployment(d) for d in body.get("deployments") or []]})
         elif a == "scale":     self._json({"result": scale(body.get("name"), body.get("replicas"))})
-        elif a == "delete":    self._json({"result": delete(body.get("name"))})
+        elif a == "delete":    self._json({"result": delete(body.get("name"), body.get("kind") or "deployment")})
         elif a == "cordon":    self._json({"result": set_schedulable(body.get("name"), False)})
         elif a == "uncordon":  self._json({"result": set_schedulable(body.get("name"), True)})
         elif a == "drain":     self._json({"result": drain(body.get("name"))})

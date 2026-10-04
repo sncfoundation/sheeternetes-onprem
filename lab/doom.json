@@ -1,5 +1,6 @@
 {
   "deployments": [
-    { "name": "doom", "image": "sicf:doom:shareware", "replicas": 1, "cpu_req": 200, "mem_req": 128 }
+    { "name": "doom", "image": "sicf:doom:shareware", "replicas": 1, "cpu_req": 200, "mem_req": 128,
+      "ports": "8666:80" }
   ]
 }
