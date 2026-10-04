@@ -34,7 +34,7 @@ case "$cmd" in
   get)
     kind="${1:-pods}"
     case "$kind" in
-      pods)        api_get pods | jq -r '["NAME","DEPLOYMENT","NODE","PHASE","CONTAINER","ENDPOINTS"], (.items[]|[.name,.deployment,.node,.phase,(.container_id|tostring|.[0:12]),((.endpoints // "") | if . == "" then "-" else . end)]) | @tsv' | column -t -s $'\t' ;;
+      pods)        api_get pods | jq -r '["NAME","DEPLOYMENT","NODE","PHASE","CONTAINER","ENDPOINTS"], (.items[]|[.name,.deployment,.node,.phase,((.container_id // "-")|tostring|.[0:12]),((.endpoints // "") | if . == "" then "-" else . end)]) | @tsv' | column -t -s $'\t' ;;
       nodes)       api_get nodes | jq -r '["NAME","IP","CPU","CPU_USED","MEM","STATUS","HEARTBEAT"], (.items[]|[.name,.ip,.cpu_total,.cpu_used,.mem_total,.status,.last_heartbeat]) | @tsv' | column -t -s $'\t' ;;
       deployments|deploy) api_get deployments | jq -r '["NAME","IMAGE","REPLICAS","CPU","MEM","PORTS"], (.items[]|[.name,.image,.replicas,.cpu_req,.mem_req,((.ports // "") | tostring | if . == "" then "-" else . end)]) | @tsv' | column -t -s $'\t' ;;
       gateways|gateway|gw) api_get gateways | jq -r '["NAME","LISTEN","REPLICAS","ADDRESS","STATUS"], (.items[]|[.name,((.listen // "") | tostring | if . == "" then "auto" else . end),((.replicas // "") | tostring | if . == "" then "1" else . end),((.address // "") | if . == "" then "-" else . end),(.status // "")]) | @tsv' | column -t -s $'\t' ;;

@@ -210,3 +210,15 @@ def test_schema_upgrade_adds_sheetgate_tabs(tmp_path):
     os.environ["WORKBOOK"] = str(wbpath); os.environ["TOKEN"] = "t"
     import apiserver; importlib.reload(apiserver)
     assert apiserver.read_tab("gateways") == [] and apiserver.read_tab("routes") == []
+
+
+def test_render_cli(monkeypatch, capsys):
+    data = {"gateways": [{"name": "public", "listen": 8080}],
+            "routes": [{"name": "r", "path": "/", "service": "web"}],
+            "deployments": [{"name": "web"}]}
+    monkeypatch.setattr(sg, "_get", lambda url, token, kind: data[kind])
+    sg.main(["render", "--gateway", "public"])
+    out = capsys.readouterr()
+    assert "set $sheetgate_upstream web:80;" in out.out and "route r: Accepted" in out.err
+    with pytest.raises(SystemExit):
+        sg.main(["render", "--gateway", "nope"])
