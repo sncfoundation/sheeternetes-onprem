@@ -30,3 +30,13 @@ NodePort story. Use `"ports": "80"` to let the scheduler pick a free host port f
 
 The `sicf:` resolution is implemented in `sicf.py`; the pack/unpack tool is `sheetbuild` in the
 [sci](https://github.com/sncfoundation/sci) repo. Tracked in sci#6 / sheeternetes#52.
+
+## Through the front door (SheetGate)
+
+Published ports are one port per workload. For a proper entrance, route DOOM by hostname
+through SheetGate, next to everything else in the cluster:
+
+```bash
+./skctl apply lab/sheetgate.json      # gateway "public" on :8080, route doom.localhost -> doom:80
+open http://doom.localhost:8080/      # rip and tear, via a Routes tab
+```

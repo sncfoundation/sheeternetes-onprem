@@ -21,7 +21,8 @@ runs your containers on bare metal. No internet required (air-gap-friendly): the
 the store, this process is the apiserver. The scheduler core is a pure, unit-tested function.
 
 Everything ships in this repo: `apiserver.py` (control plane + scheduler), `kubelet.sh` (node
-agent, needs docker), `skctl` (CLI), a `Makefile`, and `lab/hello-web.json`.
+agent, needs docker), `skctl` (CLI), `sheetgate.py` (ingress), a `Makefile`, and the `lab/`
+manifests (`hello-web.json`, `doom.json`, `sheetgate.json`).
 
 ```bash
 pip install openpyxl
@@ -32,6 +33,8 @@ make node                             # terminal 2: a kubelet (this host becomes
 make apply                            # terminal 3: apply lab/hello-web.json
 make pods                             # watch the scheduler place & run them
 ./skctl scale web 4                   # scale; kubelet converges docker to match
+make gate                             # SheetGate: http://localhost:8080 routes into the cluster
+make e2e                              # live end-to-end over real Docker (opt-in)
 ```
 
 ### Storage backends (no vendor lock)
@@ -86,6 +89,31 @@ workbook** — `image: sicf:<name>`. Pack one with [`sheetbuild`](https://github
 image, and runs it. Execution stays on the node; the sheet only stores + schedules. See
 [`lab/doom/`](lab/doom/) for the full "run DOOM from a spreadsheet" walkthrough.
 
+### Published ports (the NodePort analog)
+
+Sheetlium keeps workloads on an internal network, which is excellent for security and less
+excellent for playing DOOM. A Deployment may therefore opt in to a `ports` cell, in the
+`docker run -p` dialect your fingers already know:
+
+| `ports` | Meaning |
+|---|---|
+| `8080:80` | host port 8080 → container port 80 |
+| `80` | container port 80 on a host port **auto-assigned** from `NODEPORT_RANGE` (default `30000-32767`) |
+| `8080:80,5353:53/udp` | several, comma-separated (or a JSON list in a manifest); `/udp` for UDP |
+
+Host ports are a first-class scheduling resource: the scheduler never places two pods that
+bind the same host port and protocol on one node (the second replica spreads to another node,
+or is honestly `Unschedulable`), auto-assigned ports never steal a port some Deployment asks for
+explicitly, and an assigned port stays with its pod across reschedules. The kubelet publishes
+with `-p`, then reports what Docker *actually* bound, which lands in the Pods tab as
+`endpoints` (`10.0.0.5:8666->80/tcp`) and in `skctl get pods`. Edit the cell and the kubelet
+recreates the pod on the new port — every container carries a fingerprint of its spec.
+`SK_PUBLISH_ADDR=127.0.0.1` on a kubelet pins the bind address.
+
+```json
+{ "name": "doom", "image": "sicf:doom:shareware", "replicas": 1, "ports": "8666:80" }
+```
+
 - **Excel:** the `.xlsx` opens in Excel; edit workloads in the Deployments tab, the apiserver serves them.
 - **LibreOffice Calc:** openpyxl reads `.xlsx` only — in Calc do **Save As → Excel 2007-365 (.xlsx)**.
   (Native `.ods` + Python-UNO is on the roadmap.)
@@ -93,6 +121,69 @@ image, and runs it. Execution stays on the node; the sheet only stores + schedul
   each becomes a node and the scheduler spreads pods across them. A node that stops heartbeating
   goes `NotReady` after `NODE_TTL` (30s) and its pods are rescheduled onto survivors.
 - Or coordinate with **no server at all** via a **shared file** (SMB/NFS) — see the roadmap.
+
+## SheetGate — north-south ingress (our Ingress / Gateway API)
+
+A question raised by the community, with the gravity it deserves: *how does one reach an
+application running in Sheeternetes from outside?* Sheetlium answers east-west (pods find
+each other by Deployment name); published ports answer it one port at a time. **SheetGate**
+is the enterprise answer: a single entrypoint with host and path routing, configured — where
+else — in two tabs of the cluster spreadsheet.
+
+| Tab | Columns | Analog |
+|---|---|---|
+| `Gateways` | `name` · `listen` · `replicas` · `node_selector` · `image` · *`address`* · *`status`* | `Gateway` |
+| `Routes` | `name` · `gateway` · `host` · `path` · `service` · `port` · `rewrite` · *`status`* | `HTTPRoute` |
+
+*Italic* columns are written back by the control plane.
+
+- A **Gateway** is reconciled into an ordinary Deployment, `sheetgate-<name>` (nginx), whose
+  port 80 is published on the node at `listen` (blank = an auto NodePort). It is scheduled like
+  any other workload, so its host port obeys the same conflict rules — run `replicas: 3` and
+  you get one gateway per node.
+- A **Route** matches `host` (exact, `*.wildcard`, or blank = any host) and `path` (a
+  segment-aware prefix — `/hello` matches `/hello` and `/hello/…`, not `/helloworld`; longest
+  wins) and proxies to `service:port` — a Deployment name, i.e. a Sheetlium alias, resolved at
+  request time so a service that isn't up yet is a `502`, never a broken gateway. `rewrite`
+  replaces the matched prefix (`/hello` + `rewrite: /` → the backend sees `/`). A blank
+  `gateway` attaches the route to every gateway. Two routes claiming the same host+path: the
+  earlier row wins and the later one is marked `Conflicted`.
+- The apiserver **renders** each gateway's config from the Routes tab and ships it with the
+  gateway pod's orders; the kubelet checks it with `nginx -t`, rolls back if nginx objects, and
+  hot-reloads. Edit a cell → the gateway reloads, without a restart. It reconciles.
+- Every value is validated against a strict grammar before it gets anywhere near a config file.
+  A spreadsheet cell is user input, and user input does not get to write nginx directives.
+
+```bash
+./skctl apply lab/hello-web.json      # web x2, hello x1
+./skctl apply lab/doom.json           # DOOM, from an image stored in the sheet
+./skctl apply lab/sheetgate.json      # gateway "public" on :8080 + four routes
+
+./skctl get gateways
+# NAME    LISTEN  REPLICAS  ADDRESS         STATUS
+# public  8080    1         127.0.0.1:8080  Programmed
+./skctl get routes
+# NAME        GATEWAY  HOST             PATH    SERVICE  PORT  REWRITE  STATUS
+# doom        public   doom.localhost   /       doom     80    -        Accepted
+# hello       public   hello.localhost  /       hello    8080  -        Accepted
+# hello-path  public   *                /hello  hello    8080  /        Accepted
+# web         public   *                /       web      80    -        Accepted
+
+open http://doom.localhost:8080/                         # DOOM, through the front door
+curl -H 'Host: hello.localhost' http://localhost:8080/   # hello-from-a-spreadsheet
+curl http://localhost:8080/hello                         # same, by path
+curl http://localhost:8080/                              # web (nginx welcome page)
+```
+
+`*.localhost` resolves to your own machine in browsers and curl, so no `/etc/hosts` edits are
+required. `python3 sheetgate.py render --gateway public` prints the config the apiserver would
+ship, for the auditors. Status vocabulary: routes are `Accepted`, `BackendNotFound` (rendered,
+but no such Deployment yet), `Conflicted: <winner>`, `NoSuchGateway` or `Invalid: <reason>`;
+gateways are `Programmed`, `Pending`, `Unschedulable` or `NoReplicas`.
+
+**Honest scope:** HTTP only (TLS awaits a cert-manager analog); one gateway reaches the services
+on its own Docker host, because Sheetlium is single-host — on a multi-node cluster pin the
+gateway next to its backends with `node_selector`, or publish the backends' ports.
 
 ## Hybrid federation (local ↔ Google Sheets)
 
@@ -247,7 +338,9 @@ production run is the next validation. Do not run production on any of this. It 
 ## Roadmap
 
 - `.ods` + Python-UNO runtime; a VBA polling kubelet; a shared-file (no-server) transport.
-- Scheduler: pod anti-affinity / topology spread (bin-packing, affinity, taints, cordon, drain, migrate — done).
+- Scheduler: pod anti-affinity / topology spread (bin-packing, affinity, taints, cordon, drain, migrate, host ports — done).
+- SheetGate: TLS termination (a Sheetcert), weighted backends for canaries, multi-host upstreams
+  once Sheetlium grows an overlay (HTTP host/path routing — done).
 - HMAC-signed bridge payloads (done); next: a rendezvous "Mesh" tab and multi-peer topology.
 - Cross-substrate live migration, auto-rollback, and a two-way sync loop are in `bridge.py` (done).
 
