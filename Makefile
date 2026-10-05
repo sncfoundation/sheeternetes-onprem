@@ -3,7 +3,7 @@
 WORKBOOK ?= cluster.xlsx
 PORT     ?= 8787
 
-.PHONY: help up node apply pods nodes events tour test down clean
+.PHONY: help up node apply gate pods nodes events gateways routes tour test e2e down clean
 help:            ## show targets
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | sed 's/:.*##/\t—/' | sort
 
@@ -16,7 +16,10 @@ node:            ## run a kubelet on this host (needs docker; reads .skctl.env)
 apply:           ## apply the demo manifest
 	./skctl apply lab/hello-web.json
 
-pods nodes events: ## show pods / nodes / events
+gate:            ## apply the SheetGate demo (gateway "public" on :8080 + routes)
+	./skctl apply lab/sheetgate.json
+
+pods nodes events gateways routes: ## show pods / nodes / events / gateways / routes
 	./skctl get $@
 
 tour:            ## guided demo
@@ -25,9 +28,13 @@ tour:            ## guided demo
 test:            ## run the unit + integration suite
 	python3 -m pytest -q
 
+e2e:             ## live end-to-end over real Docker (apiserver + kubelet.sh; pulls images)
+	SK_E2E=1 python3 -m pytest -q tests/test_e2e_docker.py
+
 down:            ## stop demo workloads (scale everything created by the lab to 0)
 	-./skctl scale web 0
 	-./skctl scale hello 0
+	-./skctl delete gateway public
 
 clean:           ## remove the local workbook (destroys cluster state)
 	@echo "rm -f $(WORKBOOK)  # run this yourself to wipe cluster state"

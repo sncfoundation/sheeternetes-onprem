@@ -40,13 +40,27 @@ SK_SECRET_DIR="${SK_SECRET_DIR:-${TMPDIR:-/tmp}/sk-secrets}"; mkdir -p "$SK_SECR
 # name of the docker container backing a pod
 cname() { echo "sk_$1"; }
 
+# SheetGate: install a gateway config inside an nginx pod (stdin = config). Keep the
+# previous file, `nginx -t`, roll back on failure; record the hash only after a reload.
+SG_APPLIED=/etc/nginx/sheetgate.applied
+# shellcheck disable=SC2016  # expanded inside the container, not here
+SG_LOAD='set -e
+conf=/etc/nginx/conf.d/default.conf
+cat > /tmp/sheetgate.conf
+cp "$conf" /tmp/sheetgate.prev 2>/dev/null || : > /tmp/sheetgate.prev
+cp /tmp/sheetgate.conf "$conf"
+if ! nginx -t -q; then cp /tmp/sheetgate.prev "$conf"; exit 1; fi
+nginx -s reload
+echo "$SG_HASH" > "$SG_APPLIED"'
+
 while true; do
-  # 1) report the pods we currently run (only ours, by node label)
+  # 1) report the pods we currently run (only ours, by node label), with the host
+  #    ports docker actually published and the spec fingerprint they were started from
   running_json="$(
     docker ps --filter "label=sheeternetes.node=$NODE_NAME" \
-      --format '{{.Label "sheeternetes.pod"}}|{{.ID}}' \
+      --format '{{.Label "sheeternetes.pod"}}|{{.ID}}|{{.Ports}}|{{.Label "sheeternetes.spec"}}' \
     | jq -R -s 'split("\n") | map(select(length>0) | split("|"))
-                | map({name: .[0], phase: "Running", container_id: .[1]})'
+                | map({name: .[0], phase: "Running", container_id: .[1], ports: .[2], spec: .[3]})'
   )"
   [ -z "$running_json" ] && running_json='[]'
 
@@ -57,7 +71,8 @@ while true; do
           --arg t "$TOKEN" --arg n "$NODE_NAME" --arg ip "$NODE_IP" \
           --argjson cpu "$CPU_TOTAL" --argjson mem "$MEM_TOTAL" \
           --argjson pods "$running_json" \
-          '{token:$t, node:$n, ip:$ip, cpu_total:$cpu, mem_total:$mem, pods:$pods}')" \
+          '{token:$t, node:$n, ip:$ip, cpu_total:$cpu, mem_total:$mem,
+            pods:($pods | map(del(.spec)))}')" \
     || echo '{"pods":[]}')"
 
   desired="$(echo "$resp" | jq -c '.pods // []')"
@@ -70,6 +85,15 @@ while true; do
     cn="$(cname "$name")"
 
     if [ "$want" = "Running" ]; then
+      # spec changed (new ports, image, env...)? recreate. An apiserver that sends no
+      # spec_hash (e.g. the Apps Script one) never triggers this.
+      want_spec="$(echo "$pod" | jq -r '.spec_hash // ""')"
+      have_spec="$(echo "$running_json" | jq -r --arg n "$name" \
+        'map(select(.name==$n)) | if length>0 then .[0].spec else "-absent-" end')"
+      if [ -n "$want_spec" ] && [ "$have_spec" != "-absent-" ] && [ "$want_spec" != "$have_spec" ]; then
+        echo "[kubelet] spec changed for $name — recreating"
+        docker rm -f "$cn" >/dev/null 2>&1 || true
+      fi
       if ! docker ps -q -f "name=^${cn}$" | grep -q .; then
         image="$(echo "$pod" | jq -r '.image')"
         cmd="$(echo "$pod"   | jq -r '.command // ""')"
@@ -112,23 +136,51 @@ while true; do
           done
           IFS="$oldIFS"
         fi
-        echo "[kubelet] run $name ($image)"
+        # ports: "host:container/proto,..." as assigned by the scheduler -> docker -p
+        # (SK_PUBLISH_ADDR pins the bind address, e.g. 127.0.0.1; default: all addresses)
+        port_args=()
+        port_spec="$(echo "$pod" | jq -r '.ports // ""')"
+        if [ -n "$port_spec" ] && [ "$port_spec" != "null" ]; then
+          oldIFS="$IFS"; IFS=','
+          for pm in $port_spec; do
+            [ -n "$pm" ] && port_args+=(-p "${SK_PUBLISH_ADDR:+$SK_PUBLISH_ADDR:}$pm")
+          done
+          IFS="$oldIFS"
+        fi
+        echo "[kubelet] run $name ($image)${port_spec:+ ports $port_spec}"
         docker rm -f "$cn" >/dev/null 2>&1 || true
         # command (if any) is run through a shell so quoting/loops survive
         if [ -n "$cmd" ] && [ "$cmd" != "null" ]; then
           docker run -d --name "$cn" \
             --label sheeternetes=1 --label "sheeternetes.pod=$name" \
-            --label "sheeternetes.node=$NODE_NAME" \
+            --label "sheeternetes.node=$NODE_NAME" --label "sheeternetes.spec=$want_spec" \
             "${net_args[@]}" ${env_args[@]+"${env_args[@]}"} ${sec_args[@]+"${sec_args[@]}"} \
+            ${port_args[@]+"${port_args[@]}"} \
             --cpus "$cpus" --memory "${mem}m" \
             "$image" sh -c "$cmd" >/dev/null || echo "[kubelet] FAILED to start $name"
         else
           docker run -d --name "$cn" \
             --label sheeternetes=1 --label "sheeternetes.pod=$name" \
-            --label "sheeternetes.node=$NODE_NAME" \
+            --label "sheeternetes.node=$NODE_NAME" --label "sheeternetes.spec=$want_spec" \
             "${net_args[@]}" ${env_args[@]+"${env_args[@]}"} ${sec_args[@]+"${sec_args[@]}"} \
+            ${port_args[@]+"${port_args[@]}"} \
             --cpus "$cpus" --memory "${mem}m" \
             "$image" >/dev/null || echo "[kubelet] FAILED to start $name"
+        fi
+      fi
+      # SheetGate: a gateway pod carries its rendered config; hot-load it when the
+      # hash differs from the last one nginx accepted (validated first, rolled back on error)
+      gw_hash="$(echo "$pod" | jq -r '.gateway_config_hash // ""')"
+      if [ -n "$gw_hash" ] && docker ps -q -f "name=^${cn}$" | grep -q .; then
+        applied="$(docker exec "$cn" cat "$SG_APPLIED" 2>/dev/null || true)"
+        if [ "$applied" != "$gw_hash" ]; then
+          if echo "$pod" | jq -r '.gateway_config' \
+             | docker exec -i -e SG_HASH="$gw_hash" -e SG_APPLIED="$SG_APPLIED" "$cn" sh -c "$SG_LOAD" \
+               >/dev/null 2>"$SK_SECRET_DIR/.sheetgate.err"; then
+            echo "[kubelet] gateway $(echo "$pod" | jq -r '.gateway') config $gw_hash loaded into $name"
+          else   # (on first boot this can just be nginx still starting; retried next tick)
+            echo "[kubelet] gateway config $gw_hash not loaded into $name: $(tail -c 300 "$SK_SECRET_DIR/.sheetgate.err" | tr '\n' ' ')"
+          fi
         fi
       fi
     elif [ "$want" = "Terminating" ]; then

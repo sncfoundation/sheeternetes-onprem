@@ -1,0 +1,11 @@
+{
+  "gateways": [
+    { "name": "public", "listen": 8080, "replicas": 1 }
+  ],
+  "routes": [
+    { "name": "doom",       "gateway": "public", "host": "doom.localhost",  "path": "/",      "service": "doom",  "port": 80 },
+    { "name": "hello",      "gateway": "public", "host": "hello.localhost", "path": "/",      "service": "hello", "port": 8080 },
+    { "name": "hello-path", "gateway": "public", "host": "",                "path": "/hello", "service": "hello", "port": 8080, "rewrite": "/" },
+    { "name": "web",        "gateway": "public", "host": "",                "path": "/",      "service": "web",   "port": 80 }
+  ]
+}

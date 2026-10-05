@@ -18,9 +18,25 @@ python3 /path/to/sci/tools/sheetbuild.py import doom.tar --name doom:shareware -
 ./skctl get pods                      # doom-1  Running
 
 # the kubelet saw sicf:, called sicf.py: fetched the layers from the apiserver,
-# verified every sha256, docker-loaded the image, and ran it. Open the container's
-# port 80 in a browser and play. It reconciles. (Now with more demons.)
+# verified every sha256, docker-loaded the image, and ran it — publishing the pod's
+# port 80 on host port 8666 (the `ports` cell). Open http://localhost:8666 and play.
+./skctl get pods                      # doom-1  Running  …  ENDPOINTS 10.0.0.5:8666->80/tcp
+# It reconciles. (Now with more demons.)
 ```
+
+No manual `docker run -p` any more: `"ports": "8666:80"` in `lab/doom.json` is the whole
+NodePort story. Use `"ports": "80"` to let the scheduler pick a free host port from
+`NODEPORT_RANGE` (30000–32767) instead.
 
 The `sicf:` resolution is implemented in `sicf.py`; the pack/unpack tool is `sheetbuild` in the
 [sci](https://github.com/sncfoundation/sci) repo. Tracked in sci#6 / sheeternetes#52.
+
+## Through the front door (SheetGate)
+
+Published ports are one port per workload. For a proper entrance, route DOOM by hostname
+through SheetGate, next to everything else in the cluster:
+
+```bash
+./skctl apply lab/sheetgate.json      # gateway "public" on :8080, route doom.localhost -> doom:80
+open http://doom.localhost:8080/      # rip and tear, via a Routes tab
+```

@@ -16,7 +16,7 @@ jobs:
       - name: Install deps
         run: pip install openpyxl pytest
       - name: Compile check
-        run: python -m py_compile apiserver.py bridge.py
+        run: python -m py_compile apiserver.py apiserver_sheets.py bridge.py sheetgate.py storage.py sicf.py
       - name: Shell syntax
         run: bash -n kubelet.sh skctl lab/tour.sh
       - name: Unit + integration tests
